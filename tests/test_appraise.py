@@ -1,6 +1,9 @@
+import json
+from unittest.mock import Mock
+
 import numpy as np
 
-from pipeline.appraise import AppraisalEngine, artifacts_ready
+from pipeline.appraise import MODEL_NAME, AppraisalEngine, artifacts_ready
 
 
 CONDITION = {
@@ -40,17 +43,71 @@ def _engine():
     )
 
 
+def test_from_artifacts_loads_and_retains_engine_resources(tmp_path, monkeypatch):
+    # Catches loading resources per appraisal or wiring artifact payloads incorrectly.
+    calibration_path = tmp_path / "data/processed/condition_calibration.json"
+    calibration_path.parent.mkdir(parents=True)
+    calibration_path.write_text(
+        json.dumps({"percentile": 80, "thresholds": {"rust": 0.75}})
+    )
+    model = object()
+    preprocess = object()
+    price_models = object()
+    condition_text_pairs = object()
+    photo_gate = object()
+    comparable_index = object()
+    listings_by_id = object()
+    load_model = Mock(return_value=(model, preprocess))
+    load_price_bundle = Mock(return_value={"quantiles": [0.1, 0.5, 0.9], "models": price_models})
+    load_condition_text = Mock(return_value=condition_text_pairs)
+    load_photo_gate = Mock(return_value=photo_gate)
+    load_comparable_resources = Mock(
+        return_value=(comparable_index, listings_by_id)
+    )
+    monkeypatch.setattr("pipeline.appraise.torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr("pipeline.appraise.load_model", load_model)
+    monkeypatch.setattr("pipeline.appraise.joblib.load", load_price_bundle)
+    monkeypatch.setattr(
+        "pipeline.appraise.load_text_embeddings", load_condition_text
+    )
+    monkeypatch.setattr("pipeline.appraise.build_gate", load_photo_gate)
+    monkeypatch.setattr(
+        "pipeline.appraise.load_comparables", load_comparable_resources
+    )
+
+    engine = AppraisalEngine.from_artifacts(tmp_path)
+
+    load_model.assert_called_once_with("cpu")
+    load_price_bundle.assert_called_once_with(
+        tmp_path / "artifacts/price_model/price_models.joblib"
+    )
+    load_comparable_resources.assert_called_once_with(
+        tmp_path / "data/processed/comparables_index.npz",
+        tmp_path / "data/processed/listings_clean.csv",
+    )
+    load_condition_text.assert_called_once_with(model, "cpu")
+    load_photo_gate.assert_called_once_with(model, "cpu", MODEL_NAME)
+    assert engine.model is model
+    assert engine.preprocess is preprocess
+    assert engine.price_models is price_models
+    assert engine.condition_text_pairs is condition_text_pairs
+    assert engine.condition_thresholds == {"rust": 0.75}
+    assert engine.photo_gate is photo_gate
+    assert engine.comparable_index is comparable_index
+    assert engine.listings_by_id is listings_by_id
+
+
 def test_appraise_returns_complete_accepted_result(monkeypatch):
     # Catches bypassing confidence adjustment, condition output, or real comparable ranking.
-    paths = ["truck-a.jpg", "truck-b.jpg", "truck-c.jpg"]
+    paths = ["truck-a.jpg", "truck-b.jpg", "truck-c.jpg", "dark.jpg"]
     monkeypatch.setattr(
         "pipeline.appraise.gate_images",
         lambda *args: {
             "accepted": True,
-            "confidence": "high",
-            "usable_paths": paths,
-            "rejected": [],
-            "warnings": [],
+            "confidence": "medium",
+            "usable_paths": paths[:3],
+            "rejected": [{"path": paths[3], "reasons": ["too_dark"]}],
+            "warnings": ["some_photos_rejected"],
             "reasons": [],
         },
     )
@@ -70,11 +127,11 @@ def test_appraise_returns_complete_accepted_result(monkeypatch):
 
     assert result == {
         "accepted": True,
-        "price_low": 24_000.0,
+        "price_low": 22_500.0,
         "price_median": 30_000.0,
-        "price_high": 37_000.0,
-        "confidence": "high",
-        "warnings": [],
+        "price_high": 38_750.0,
+        "confidence": "medium",
+        "warnings": ["some_photos_rejected"],
         "reasons": [],
         "condition": CONDITION,
         "comparables": [
