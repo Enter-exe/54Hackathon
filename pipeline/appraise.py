@@ -86,6 +86,16 @@ class AppraisalEngine:
                     "accepted": False,
                     "confidence": "low",
                     "reasons": ["no_usable_truck_photos"],
+                    "rejected": [
+                        *gate_result.get("rejected", []),
+                        *[
+                            {
+                                "path": path,
+                                "reasons": ["no_usable_truck_photos"],
+                            }
+                            for path in gate_result["usable_paths"]
+                        ],
+                    ],
                 }
             )
 
@@ -113,6 +123,7 @@ class AppraisalEngine:
     def _rejected(gate_result: dict) -> dict:
         return {
             **adjust_price_range([], gate_result),
+            "rejected": gate_result.get("rejected", []),
             "condition": {},
             "comparables": [],
         }

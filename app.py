@@ -229,8 +229,17 @@ def render_result(result: dict, photo_names: list[str] | None = None) -> None:
         )
         rejected = result.get("rejected", [])
         if rejected:
-            for index, photo in enumerate(rejected):
-                name = photo_names[index] if index < len(photo_names) else Path(photo["path"]).name
+            for photo in rejected:
+                path = Path(photo["path"])
+                try:
+                    upload_index = int(path.stem) - 1
+                except ValueError:
+                    upload_index = -1
+                name = (
+                    photo_names[upload_index]
+                    if 0 <= upload_index < len(photo_names)
+                    else path.name
+                )
                 reasons = ", ".join(
                     LABELS.get(reason, reason.replace("_", " ").title())
                     for reason in photo.get("reasons", [])

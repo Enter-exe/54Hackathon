@@ -91,22 +91,19 @@ def test_render_result_shows_complete_accepted_appraisal(tmp_path):
 
 
 def test_render_result_shows_rejection_recovery_by_photo():
-    # Catches rejected appraisals leaking a price or hiding photo-level recovery.
-    result = {
+    # Catches dropping engine rejections or pairing them with the wrong upload name.
+    from pipeline.appraise import AppraisalEngine
+
+    result = AppraisalEngine._rejected({
         "accepted": False,
-        "price_low": None,
-        "price_median": None,
-        "price_high": None,
         "confidence": "low",
         "warnings": ["some_photos_rejected"],
         "reasons": ["no_usable_truck_photos"],
-        "condition": {},
-        "comparables": [],
         "rejected": [
-            {"path": "/tmp/1.jpg", "reasons": ["too_dark", "too_blurry"]},
-            {"path": "/tmp/2.png", "reasons": ["not_truck"]},
+            {"path": "/tmp/2.png", "reasons": ["too_dark", "too_blurry"]},
+            {"path": "/tmp/1.jpg", "reasons": ["not_truck"]},
         ],
-    }
+    })
 
     app = AppTest.from_function(
         _render_result,
@@ -117,8 +114,6 @@ def test_render_result_shows_rejection_recovery_by_photo():
     assert not app.exception
     assert app.error[0].value.startswith("No usable truck photos")
     assert not app.metric
-    rendered_text = " ".join(item.value for item in app.markdown)
-    assert "cab.jpg" in rendered_text
-    assert "Too dark" in rendered_text
-    assert "side.png" in rendered_text
-    assert "Not a truck" in rendered_text
+    rendered_rows = [item.value for item in app.markdown]
+    assert any("cab.jpg" in row and "Not a truck" in row for row in rendered_rows)
+    assert any("side.png" in row and "Too dark" in row for row in rendered_rows)

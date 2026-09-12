@@ -193,6 +193,7 @@ def test_appraise_returns_complete_rejected_result(monkeypatch):
         "confidence": "low",
         "warnings": ["some_photos_rejected"],
         "reasons": ["no_usable_truck_photos"],
+        "rejected": [{"path": "motorcycle.jpg", "reasons": ["not_truck"]}],
         "condition": {},
         "comparables": [],
     }
@@ -206,8 +207,8 @@ def test_appraise_rejects_when_photo_filter_removes_every_embedding(monkeypatch)
             "accepted": True,
             "confidence": "high",
             "usable_paths": ["truck.jpg"],
-            "rejected": [],
-            "warnings": [],
+            "rejected": [{"path": "dark.jpg", "reasons": ["too_dark"]}],
+            "warnings": ["some_photos_rejected"],
             "reasons": [],
         },
     )
@@ -223,8 +224,12 @@ def test_appraise_rejects_when_photo_filter_removes_every_embedding(monkeypatch)
         "price_median": None,
         "price_high": None,
         "confidence": "low",
-        "warnings": [],
+        "warnings": ["some_photos_rejected"],
         "reasons": ["no_usable_truck_photos"],
+        "rejected": [
+            {"path": "dark.jpg", "reasons": ["too_dark"]},
+            {"path": "truck.jpg", "reasons": ["no_usable_truck_photos"]},
+        ],
         "condition": {},
         "comparables": [],
     }
