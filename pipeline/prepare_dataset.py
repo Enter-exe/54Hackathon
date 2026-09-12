@@ -65,7 +65,7 @@ def prepare_sales_data(
     repo_root = Path(repo_root)
     source = pd.read_csv(dataset_dir / "truck_sales_100.csv", dtype={"item_id": str})
     clean = source.rename(columns=COLUMN_MAP)[
-        ["ad_id", "price", "year", "make_name", "model_name", "state_code", "image_paths"]
+        ["ad_id", "price", "year", "make_name", "model_name", "state_code", "image_paths", "source_url"]
     ].copy()
     clean = clean[clean["ad_id"].notna()].copy()
     clean["ad_id"] = clean["ad_id"].astype(str)

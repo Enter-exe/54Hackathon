@@ -25,6 +25,7 @@ def _write_fixture_sales(dataset_dir: Path, count: int = 20) -> None:
                 "state": "OK",
                 "sale_price_usd_including_buyer_premium": float(number),
                 "image_paths": f"images/{ad_id}/truck.jpg",
+                "source_url": f"https://example.com/{ad_id}",
             }
         )
     pd.DataFrame(rows).to_csv(dataset_dir / "truck_sales_100.csv", index=False)
@@ -43,13 +44,14 @@ def test_prepare_sales_data_normalizes_filters_and_splits_fixture_sales(tmp_path
         dataset_dir, second_processed_dir, repo_root, seed=0
     )
 
-    assert {"ad_id", "price", "year", "make_name", "model_name", "image_paths"} <= set(clean)
+    assert {"ad_id", "price", "year", "make_name", "model_name", "image_paths", "source_url"} <= set(clean)
     assert clean["ad_id"].map(type).eq(str).all()
     assert clean["ad_id"].tolist() == [f"SALE{number:03d}" for number in range(2, 20)]
     assert clean["price"].tolist() == [float(number) for number in range(2, 20)]
     assert clean["make_name"].eq("Make").all()
     assert clean["model_name"].tolist() == [f"Model {number}" for number in range(2, 20)]
     assert clean["state_code"].eq("OK").all()
+    assert clean["source_url"].tolist() == [f"https://example.com/SALE{number:03d}" for number in range(2, 20)]
     assert all((repo_root / path).is_file() for paths in clean["image_paths"] for path in paths)
     assert not (set(splits["train"]) & set(splits["val"]))
     assert not (set(splits["train"]) & set(splits["test"]))

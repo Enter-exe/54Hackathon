@@ -40,6 +40,7 @@ def _write_sales_fixture(dataset_dir, count=20):
                 "model": "Model",
                 "state": "OK",
                 "image_paths": f"images/{item_id}/truck.jpg",
+                "source_url": f"https://example.com/{item_id}",
             }
         )
     pd.DataFrame(rows).to_csv(dataset_dir / "truck_sales_100.csv", index=False)

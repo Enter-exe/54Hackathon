@@ -62,3 +62,16 @@ def test_load_comparables_rejects_index_row_count_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="index embeddings and ad_id must contain the same number of rows"):
         load_comparables(index_path, listings_path)
+
+
+def test_load_comparables_preserves_source_url_for_result_projection(tmp_path):
+    # Catches canonical CSV loading that drops the comparable source link.
+    listings_path = tmp_path / "listings.csv"
+    write_listings_csv(pd.DataFrame(_rows().values()), listings_path)
+    index_path = tmp_path / "comparables_index.npz"
+    np.savez(index_path, embeddings=_index()["embeddings"], ad_id=_index()["ad_id"])
+
+    index, listings_by_id = load_comparables(index_path, listings_path)
+    result = find_comparables(np.array([1.0, 0.0]), index, listings_by_id, k=1)
+
+    assert result[0]["source_url"] == "https://example.com/a"
