@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from ui.appraisal import PRICE_MODEL_PATH, find_comparables, load_resources, run_appraisal
+from ui.appraisal import PRICE_MODEL_PATH, find_comparables, load_resources, predict_make, run_appraisal
 
 pytestmark = pytest.mark.skipif(
     not PRICE_MODEL_PATH.exists(), reason="trained price model not present; run the pipeline scripts first"
@@ -38,6 +38,7 @@ def test_run_appraisal_rejects_dark_photo_without_touching_price_model(resources
     assert result["condition"] is None
     assert result["price"] is None
     assert result["comparables"] is None
+    assert result["predicted_make"] is None
 
 
 def test_run_appraisal_full_pipeline_on_a_real_listing_photo(resources):
@@ -64,6 +65,12 @@ def test_run_appraisal_full_pipeline_on_a_real_listing_photo(resources):
     sims = [c["similarity"] for c in result["comparables"]]
     assert sims == sorted(sims, reverse=True)
 
+    if resources["spec_classifier"] is not None:
+        assert result["predicted_make"] is not None
+        assert len(result["predicted_make"]) == 2
+        probs = [m["probability"] for m in result["predicted_make"]]
+        assert probs == sorted(probs, reverse=True)
+
 
 def test_find_comparables_returns_k_nearest_by_cosine_similarity(resources):
     index = resources["comparables_index"]
@@ -75,3 +82,15 @@ def test_find_comparables_returns_k_nearest_by_cosine_similarity(resources):
     assert len(results) == 3
     assert results[0]["ad_id"] == str(index["ad_id"][0])
     assert results[0]["similarity"] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_predict_make_returns_probabilities_summing_towards_one(resources):
+    if resources["spec_classifier"] is None:
+        pytest.skip("no trained spec classifier present")
+    query = resources["comparables_index"]["embeddings"][0]
+
+    results = predict_make(query, resources["spec_classifier"], top_k=2)
+
+    assert len(results) == 2
+    assert all(0.0 <= r["probability"] <= 1.0 for r in results)
+    assert results[0]["probability"] >= results[1]["probability"]

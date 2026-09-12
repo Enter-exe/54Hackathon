@@ -20,12 +20,14 @@ from pipeline.gate_images import gate_images
 PRICE_MODEL_PATH = Path("artifacts/price_model/price_models.joblib")
 CALIBRATION_PATH = Path("data/processed/condition_calibration.json")
 COMPARABLES_INDEX_PATH = Path("data/processed/comparables_index.npz")
+SPEC_CLASSIFIER_PATH = Path("artifacts/spec_classifier/make_classifier.joblib")
 
 
 def load_resources(
     price_model_path: Path = PRICE_MODEL_PATH,
     calibration_path: Path = CALIBRATION_PATH,
     comparables_index_path: Path = COMPARABLES_INDEX_PATH,
+    spec_classifier_path: Path = SPEC_CLASSIFIER_PATH,
 ):
     if not Path(price_model_path).exists():
         return None
@@ -35,6 +37,7 @@ def load_resources(
     bundle = joblib.load(price_model_path)
     calibration = json.loads(Path(calibration_path).read_text()) if Path(calibration_path).exists() else None
     comparables_index = np.load(comparables_index_path, allow_pickle=True) if Path(comparables_index_path).exists() else None
+    spec_classifier = joblib.load(spec_classifier_path) if Path(spec_classifier_path).exists() else None
     return {
         "device": device,
         "model": model,
@@ -43,7 +46,22 @@ def load_resources(
         "bundle": bundle,
         "calibration": calibration,
         "comparables_index": comparables_index,
+        "spec_classifier": spec_classifier,
     }
+
+
+def predict_make(pooled_embedding: np.ndarray, spec_classifier: dict, top_k: int = 2) -> list[dict]:
+    """Trained (class-weighted logistic regression) make prediction, with
+    calibrated probabilities -- unlike find_comparables()'s nearest-neighbor
+    lookup, this can express "58% Ford, 35% Chevrolet" instead of a single
+    falsely-confident guess when two makes look genuinely similar (e.g. Ford
+    Econoline vs Chevrolet Express, both full-size cutaway vans -- a real
+    reported miss that motivated adding this).
+    """
+    clf, encoder = spec_classifier["classifier"], spec_classifier["label_encoder"]
+    probs = clf.predict_proba(pooled_embedding.reshape(1, -1))[0]
+    order = np.argsort(-probs)[:top_k]
+    return [{"make_name": encoder.classes_[i], "probability": float(probs[i])} for i in order]
 
 
 def find_comparables(pooled_embedding: np.ndarray, comparables_index, k: int = 3) -> list[dict]:
@@ -74,14 +92,15 @@ def find_comparables(pooled_embedding: np.ndarray, comparables_index, k: int = 3
 
 def run_appraisal(paths: list[str], resources: dict) -> dict:
     """Runs the full pipeline on a listing's photos: gate -> embed -> condition
-    -> price -> comparables. Returns {"gate", "condition", "price", "comparables"},
-    with condition/price/comparables None when the gate rejects all photos.
+    -> price -> comparables -> predicted make. Returns {"gate", "condition",
+    "price", "comparables", "predicted_make"}, with the latter four None when
+    the gate rejects all photos.
     """
     device, model, preprocess = resources["device"], resources["model"], resources["preprocess"]
     gate_result = gate_images(paths, model, preprocess, device)
 
     if not gate_result["accepted"]:
-        return {"gate": gate_result, "condition": None, "price": None, "comparables": None}
+        return {"gate": gate_result, "condition": None, "price": None, "comparables": None, "predicted_make": None}
 
     usable_paths = gate_result["usable_paths"]
     embs = embed_images(usable_paths, model, preprocess, device)
@@ -106,5 +125,14 @@ def run_appraisal(paths: list[str], resources: dict) -> dict:
     comparables_result = (
         find_comparables(pooled, resources["comparables_index"]) if resources["comparables_index"] is not None else None
     )
+    predicted_make_result = (
+        predict_make(pooled, resources["spec_classifier"]) if resources["spec_classifier"] is not None else None
+    )
 
-    return {"gate": gate_result, "condition": condition_result, "price": price_result, "comparables": comparables_result}
+    return {
+        "gate": gate_result,
+        "condition": condition_result,
+        "price": price_result,
+        "comparables": comparables_result,
+        "predicted_make": predicted_make_result,
+    }
