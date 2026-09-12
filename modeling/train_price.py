@@ -13,10 +13,20 @@ from sklearn.metrics import mean_absolute_error, mean_pinball_loss, r2_score
 
 SPLIT_NAMES = ("train", "val", "test")
 QUANTILES = (0.1, 0.5, 0.9)
+CONDITION_COLUMNS = ("rust_prob", "body_damage_prob", "tire_wear_prob", "interior_wear_prob")
 
 
-def load_training_data(embeddings_path, listings_path, splits_path):
-    """Load, validate, and align embeddings, prices, and split membership."""
+def load_training_data(embeddings_path, listings_path, splits_path, condition_tags_path=None):
+    """Load, validate, and align embeddings, prices, and split membership.
+
+    condition_tags_path: optional path to pipeline/condition_assessment.py's
+    output (rust/body_damage/tire_wear/interior_wear probabilities). When
+    given and the file exists, those columns are concatenated onto the CLIP
+    embedding so the price model can see a condition signal it otherwise
+    has no access to. A path that's explicitly given but missing raises,
+    same as any other input here; the CLI default is treated as optional
+    (skipped if the file hasn't been produced yet).
+    """
     with np.load(embeddings_path, allow_pickle=False) as cache:
         missing_arrays = {"ad_ids", "embeddings"} - set(cache.files)
         if missing_arrays:
@@ -49,6 +59,23 @@ def load_training_data(embeddings_path, listings_path, splits_path):
     prices = prices_by_id.loc[ad_ids].to_numpy(dtype=float)
     if not np.isfinite(prices).all() or np.any(prices <= 0):
         raise ValueError("prices must be positive finite values")
+
+    if condition_tags_path is not None and Path(condition_tags_path).exists():
+        condition_df = pd.read_parquet(condition_tags_path)
+        missing_condition_columns = set(CONDITION_COLUMNS) - set(condition_df.columns)
+        if missing_condition_columns:
+            raise ValueError(f"condition tags missing columns: {sorted(missing_condition_columns)}")
+        condition_ids = condition_df["ad_id"].astype(str)
+        if condition_ids.duplicated().any():
+            raise ValueError("condition tag ad_ids must be unique")
+        condition_by_id = condition_df.set_index(condition_ids)[list(CONDITION_COLUMNS)]
+        missing_condition = sorted(set(ad_ids) - set(condition_by_id.index))
+        if missing_condition:
+            raise ValueError(f"embeddings missing condition tags: {missing_condition[:5]}")
+        condition_features = condition_by_id.loc[ad_ids].to_numpy(dtype=float)
+        if not np.isfinite(condition_features).all():
+            raise ValueError("condition features must contain only finite values")
+        embeddings = np.concatenate([embeddings, condition_features], axis=1)
 
     splits = json.loads(Path(splits_path).read_text())
     if set(splits) != set(SPLIT_NAMES):
@@ -101,9 +128,33 @@ def predict_quantiles(models, X):
     return np.sort(predictions, axis=1)
 
 
-def evaluate(models, X, y):
+def compute_calibration_margin(models, X, y, target_coverage=0.8):
+    """Conformalized-quantile-regression correction (Romano et al. 2019): how
+    much to widen (or narrow) the [q10, q90] interval so it actually achieves
+    target_coverage on held-out data, instead of trusting the raw quantile
+    regressors' calibration. Measured need: the uncorrected interval was
+    hitting ~63-68% empirical coverage against an 80% nominal target.
+
+    Must be computed on a split the models were not trained on (val), then
+    applied to any other split (val for a calibrated read of held-out
+    performance, test for the real held-out check) -- applying it to the
+    same data it was fit on would trivially inflate coverage.
+    """
+    lower, _, upper = predict_quantiles(models, X).T
+    scores = np.maximum(lower - y, y - upper)
+    n = len(y)
+    q_level = min(1.0, np.ceil((n + 1) * target_coverage) / n)
+    return float(np.quantile(scores, q_level, method="higher"))
+
+
+def apply_margin(predictions, margin):
+    lower, median, upper = predictions.T
+    return np.column_stack([lower - margin, median, upper + margin])
+
+
+def evaluate(models, X, y, margin=0.0):
     """Calculate range calibration and point/quantile errors."""
-    predictions = predict_quantiles(models, X)
+    predictions = apply_margin(predict_quantiles(models, X), margin)
     lower, median, upper = predictions.T
     return {
         "pinball_q10": float(mean_pinball_loss(y, lower, alpha=0.1)),
@@ -121,18 +172,23 @@ def run_training(
     splits_path,
     out_dir,
     n_estimators=200,
+    condition_tags_path=None,
+    target_coverage=0.8,
 ):
     """Train from on-disk inputs and save the models and held-out metrics."""
-    split_data = load_training_data(embeddings_path, listings_path, splits_path)
+    split_data = load_training_data(embeddings_path, listings_path, splits_path, condition_tags_path)
     models = train_models(*split_data["train"], n_estimators=n_estimators)
+
+    margin = compute_calibration_margin(models, *split_data["val"], target_coverage=target_coverage)
     metrics = {
-        name: evaluate(models, *split_data[name]) for name in ("val", "test")
+        name: evaluate(models, *split_data[name], margin=margin) for name in ("val", "test")
     }
+    metrics["calibration_margin"] = margin
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(
-        {"quantiles": list(QUANTILES), "models": models},
+        {"quantiles": list(QUANTILES), "models": models, "calibration_margin": margin},
         out_dir / "price_models.joblib",
     )
     (out_dir / "price_metrics.json").write_text(
@@ -152,6 +208,12 @@ def main():
     parser.add_argument("--splits", default="data/processed/splits.json")
     parser.add_argument("--out-dir", default="artifacts/price_model")
     parser.add_argument("--n-estimators", type=int, default=200)
+    parser.add_argument(
+        "--condition-tags",
+        default="data/processed/condition_tags.parquet",
+        help="path to condition_assessment.py output; skipped if it doesn't exist",
+    )
+    parser.add_argument("--target-coverage", type=float, default=0.8)
     args = parser.parse_args()
 
     metrics = run_training(
@@ -160,6 +222,8 @@ def main():
         args.splits,
         args.out_dir,
         n_estimators=args.n_estimators,
+        condition_tags_path=args.condition_tags,
+        target_coverage=args.target_coverage,
     )
     print(json.dumps(metrics, indent=2))
 
