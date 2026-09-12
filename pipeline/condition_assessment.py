@@ -34,6 +34,7 @@ import open_clip
 import pandas as pd
 import torch
 
+from pipeline.data_io import read_listings_csv
 from pipeline.extract_embeddings import MODEL_NAME, embed_images, load_model
 from pipeline.gating import build_gate, gate_mask
 
@@ -151,7 +152,7 @@ def run(data_dir: Path, percentile: float = DEFAULT_PERCENTILE) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    df = pd.read_parquet(processed_dir / "listings_clean.parquet")
+    df = read_listings_csv(processed_dir / "listings_clean.csv")
     with open(processed_dir / "splits.json") as f:
         splits = json.load(f)
     split_of = {ad_id: split_name for split_name, ids in splits.items() for ad_id in ids}
@@ -186,10 +187,10 @@ def run(data_dir: Path, percentile: float = DEFAULT_PERCENTILE) -> None:
         name = attr["name"]
         out_df.loc[:, f"{name}_flag"] = out_df[f"{name}_prob"] >= thresholds[name]
 
-    out_df.to_parquet(processed_dir / "condition_tags.parquet", index=False)
+    out_df.to_csv(processed_dir / "condition_tags.csv", index=False)
     with open(processed_dir / "condition_calibration.json", "w") as f:
         json.dump({"percentile": percentile, "thresholds": thresholds}, f, indent=2)
-    print(f"Wrote {processed_dir / 'condition_tags.parquet'} ({len(out_df)} listings)")
+    print(f"Wrote {processed_dir / 'condition_tags.csv'} ({len(out_df)} listings)")
     print(f"Wrote {processed_dir / 'condition_calibration.json'}")
     for attr in ATTRIBUTES:
         name = attr["name"]

@@ -15,6 +15,7 @@ from modeling.train_price import (
     run_training,
     train_models,
 )
+from pipeline.data_io import write_listings_csv
 
 
 class TrainingDataTests(unittest.TestCase):
@@ -22,18 +23,22 @@ class TrainingDataTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.root = Path(self.temp_dir.name)
         self.embeddings_path = self.root / "listing_embeddings.npz"
-        self.listings_path = self.root / "listings_clean.parquet"
+        self.listings_path = self.root / "listings_clean.csv"
         self.splits_path = self.root / "splits.json"
 
         self.ids = np.array([f"truck-{i}" for i in range(10)])
         embeddings = np.arange(30, dtype=np.float32).reshape(10, 3)
         np.savez(self.embeddings_path, ad_ids=self.ids, embeddings=embeddings)
-        pd.DataFrame(
-            {
-                "ad_id": self.ids[::-1],
-                "price": np.arange(19_000, 9_000, -1_000, dtype=float),
-            }
-        ).to_parquet(self.listings_path, index=False)
+        write_listings_csv(
+            pd.DataFrame(
+                {
+                    "ad_id": self.ids[::-1],
+                    "price": np.arange(19_000, 9_000, -1_000, dtype=float),
+                    "image_paths": [[] for _ in self.ids],
+                }
+            ),
+            self.listings_path,
+        )
         self.write_splits(self.ids[:6], self.ids[6:8], self.ids[8:])
 
     def tearDown(self):
