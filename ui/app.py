@@ -80,25 +80,22 @@ def render_condition(condition_result: dict) -> None:
     st.caption("Flags mean this truck looks worse than about 80% of comparable listings on that attribute — not a guarantee of damage.")
 
 
-def render_predicted_specs(predicted_make_result: list[dict] | None, comparables_result: list[dict] | None) -> None:
-    st.subheader("Predicted specs")
+def render_predicted_make(predicted_make_result: list[dict] | None) -> None:
+    st.subheader("Predicted make")
 
-    if predicted_make_result:
-        top, runner_up = predicted_make_result[0], predicted_make_result[1] if len(predicted_make_result) > 1 else None
-        st.markdown(f"**Make: {top['make_name'].title()}** ({top['probability']:.0%} confidence)")
-        if runner_up and runner_up["probability"] >= 0.25:
-            st.caption(f"Close call — could also be {runner_up['make_name'].title()} ({runner_up['probability']:.0%}).")
-        st.caption("From a trained classifier (logistic regression on the same image embeddings), not a lookup.")
-    else:
+    if not predicted_make_result:
         st.caption("No trained make classifier available.")
+        return
 
-    if comparables_result:
-        top_match = comparables_result[0]
-        st.markdown(f"Model / year (closest match): **{top_match['year']} {top_match['model_name']}**")
-        st.caption(
-            f"From the nearest real listing by visual similarity ({top_match['similarity']:.2f}), not a trained "
-            "classifier — there isn't one for model/year yet, so treat this as a rough sanity check only."
-        )
+    top, runner_up = predicted_make_result[0], predicted_make_result[1] if len(predicted_make_result) > 1 else None
+    st.markdown(f"**{top['make_name'].title()}** ({top['probability']:.0%} confidence)")
+    if runner_up and runner_up["probability"] >= 0.25:
+        st.caption(f"Close call — could also be {runner_up['make_name'].title()} ({runner_up['probability']:.0%}).")
+    st.caption("From a trained classifier (logistic regression on the same image embeddings), not a lookup.")
+    st.caption(
+        "Model/year aren't predicted here — there isn't enough training data per model to classify those "
+        "reliably yet. The closest real match's model/year shows up in \"Why this price\" below as reference, not a claim."
+    )
 
 
 def render_comparables(comparables_result: list[dict] | None) -> None:
@@ -153,7 +150,7 @@ def main():
         return
 
     render_price(result["price"])
-    render_predicted_specs(result["predicted_make"], result["comparables"])
+    render_predicted_make(result["predicted_make"])
     render_condition(result["condition"])
     render_comparables(result["comparables"])
 
