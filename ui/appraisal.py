@@ -19,9 +19,14 @@ from pipeline.gate_images import gate_images
 
 PRICE_MODEL_PATH = Path("artifacts/price_model/price_models.joblib")
 CALIBRATION_PATH = Path("data/processed/condition_calibration.json")
+COMPARABLES_INDEX_PATH = Path("data/processed/comparables_index.npz")
 
 
-def load_resources(price_model_path: Path = PRICE_MODEL_PATH, calibration_path: Path = CALIBRATION_PATH):
+def load_resources(
+    price_model_path: Path = PRICE_MODEL_PATH,
+    calibration_path: Path = CALIBRATION_PATH,
+    comparables_index_path: Path = COMPARABLES_INDEX_PATH,
+):
     if not Path(price_model_path).exists():
         return None
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -29,6 +34,7 @@ def load_resources(price_model_path: Path = PRICE_MODEL_PATH, calibration_path: 
     condition_text_pairs = load_text_embeddings(model, device)
     bundle = joblib.load(price_model_path)
     calibration = json.loads(Path(calibration_path).read_text()) if Path(calibration_path).exists() else None
+    comparables_index = np.load(comparables_index_path, allow_pickle=True) if Path(comparables_index_path).exists() else None
     return {
         "device": device,
         "model": model,
@@ -36,19 +42,46 @@ def load_resources(price_model_path: Path = PRICE_MODEL_PATH, calibration_path: 
         "condition_text_pairs": condition_text_pairs,
         "bundle": bundle,
         "calibration": calibration,
+        "comparables_index": comparables_index,
     }
+
+
+def find_comparables(pooled_embedding: np.ndarray, comparables_index, k: int = 3) -> list[dict]:
+    """Nearest neighbors (by CLIP embedding cosine similarity, both sides
+    unit-normalized) among the train-split listings. This is NOT a trained
+    classifier -- there isn't one for make/model/year in this pipeline --
+    it's "which real listings in our data look most like this truck", used
+    both to show checkable reasoning behind the price and, as a byproduct,
+    a "predicted specs" readout: the closest match's year/make/model, for
+    spot-checking whether the visual similarity is actually finding the
+    right kind of truck.
+    """
+    embeddings = comparables_index["embeddings"]
+    sims = embeddings @ pooled_embedding
+    order = np.argsort(-sims)[:k]
+    return [
+        {
+            "ad_id": str(comparables_index["ad_id"][i]),
+            "year": int(comparables_index["year"][i]),
+            "make_name": str(comparables_index["make_name"][i]),
+            "model_name": str(comparables_index["model_name"][i]),
+            "price": float(comparables_index["price"][i]),
+            "similarity": float(sims[i]),
+        }
+        for i in order
+    ]
 
 
 def run_appraisal(paths: list[str], resources: dict) -> dict:
     """Runs the full pipeline on a listing's photos: gate -> embed -> condition
-    -> price. Returns {"gate": ..., "condition": ... | None, "price": ... | None}.
-    condition/price are None when the gate rejects all photos.
+    -> price -> comparables. Returns {"gate", "condition", "price", "comparables"},
+    with condition/price/comparables None when the gate rejects all photos.
     """
     device, model, preprocess = resources["device"], resources["model"], resources["preprocess"]
     gate_result = gate_images(paths, model, preprocess, device)
 
     if not gate_result["accepted"]:
-        return {"gate": gate_result, "condition": None, "price": None}
+        return {"gate": gate_result, "condition": None, "price": None, "comparables": None}
 
     usable_paths = gate_result["usable_paths"]
     embs = embed_images(usable_paths, model, preprocess, device)
@@ -70,4 +103,8 @@ def run_appraisal(paths: list[str], resources: dict) -> dict:
     calibrated_quantiles = apply_margin(raw_quantiles, bundle["calibration_margin"])[0]
     price_result = adjust_price_range(calibrated_quantiles, gate_result)
 
-    return {"gate": gate_result, "condition": condition_result, "price": price_result}
+    comparables_result = (
+        find_comparables(pooled, resources["comparables_index"]) if resources["comparables_index"] is not None else None
+    )
+
+    return {"gate": gate_result, "condition": condition_result, "price": price_result, "comparables": comparables_result}

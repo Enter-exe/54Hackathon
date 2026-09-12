@@ -1,5 +1,5 @@
-"""Demo UI: upload photos of a used box truck, get a price range, a
-condition assessment, and (once built) comparable listings as reasoning.
+"""Demo UI: upload photos of a used box truck, get a price range, predicted
+specs and condition assessment, and comparable listings as reasoning.
 
 Run with: streamlit run ui/app.py
 
@@ -80,9 +80,36 @@ def render_condition(condition_result: dict) -> None:
     st.caption("Flags mean this truck looks worse than about 80% of comparable listings on that attribute — not a guarantee of damage.")
 
 
-def render_comparables_placeholder() -> None:
+def render_predicted_specs(comparables_result: list[dict] | None) -> None:
+    st.subheader("Predicted specs")
+    if not comparables_result:
+        st.caption("No comparables index available — can't estimate specs.")
+        return
+    top = comparables_result[0]
+    st.markdown(f"**{top['year']} {top['make_name']} {top['model_name']}**")
+    st.caption(
+        f"Closest visual match in the training data (similarity {top['similarity']:.2f}). "
+        "This is a nearest-neighbor lookup, not a trained make/model/year classifier — "
+        "use it to sanity-check that the visual match is at least in the right ballpark."
+    )
+
+
+def render_comparables(comparables_result: list[dict] | None) -> None:
     st.subheader("Why this price")
-    st.info("🚧 Comparable listings (the checkable reasoning behind the estimate) aren't wired up yet — placeholder for now.")
+    if not comparables_result:
+        st.info("🚧 Comparable listings aren't available (no comparables index found).")
+        return
+    st.caption("The most visually similar real listings behind this estimate:")
+    cols = st.columns(len(comparables_result))
+    for col, comp in zip(cols, comparables_result):
+        with col:
+            thumb_dir = Path(f"data/images/{comp['ad_id']}")
+            thumb = next(thumb_dir.glob("*.webp"), None) if thumb_dir.exists() else None
+            if thumb:
+                st.image(str(thumb), use_container_width=True)
+            st.write(f"{comp['year']} {comp['make_name']} {comp['model_name']}")
+            st.write(f"${comp['price']:,.0f}")
+            st.caption(f"similarity {comp['similarity']:.2f}")
 
 
 def main():
@@ -119,8 +146,9 @@ def main():
         return
 
     render_price(result["price"])
+    render_predicted_specs(result["comparables"])
     render_condition(result["condition"])
-    render_comparables_placeholder()
+    render_comparables(result["comparables"])
 
 
 if __name__ == "__main__":
