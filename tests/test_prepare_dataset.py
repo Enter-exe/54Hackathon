@@ -34,10 +34,14 @@ def test_prepare_sales_data_normalizes_filters_and_splits_fixture_sales(tmp_path
     repo_root = tmp_path / "repo"
     dataset_dir = repo_root / "data" / "commercial_truck_sales_100"
     processed_dir = repo_root / "data" / "processed"
+    second_processed_dir = repo_root / "data" / "processed_again"
     dataset_dir.mkdir(parents=True)
     _write_fixture_sales(dataset_dir)
 
     clean, splits = prepare_sales_data(dataset_dir, processed_dir, repo_root, seed=0)
+    _, repeated_splits = prepare_sales_data(
+        dataset_dir, second_processed_dir, repo_root, seed=0
+    )
 
     assert {"ad_id", "price", "year", "make_name", "model_name", "image_paths"} <= set(clean)
     assert clean["ad_id"].map(type).eq(str).all()
@@ -52,6 +56,7 @@ def test_prepare_sales_data_normalizes_filters_and_splits_fixture_sales(tmp_path
     assert not (set(splits["val"]) & set(splits["test"]))
     assert set().union(*map(set, splits.values())) == set(clean["ad_id"])
     assert {name: len(ids) for name, ids in splits.items()} == {"train": 14, "val": 2, "test": 2}
+    assert repeated_splits == splits
     assert read_listings_csv(processed_dir / "listings_clean.csv")["image_paths"].map(bool).all()
     assert json.loads((processed_dir / "splits.json").read_text()) == splits
 
@@ -67,7 +72,9 @@ def test_prepare_sales_data_rejects_duplicate_nonpositive_nonfinite_and_imageles
     sales.loc[1, "item_id"] = "SALE001"
     sales.loc[2, "sale_price_usd_including_buyer_premium"] = 0
     sales.loc[3, "sale_price_usd_including_buyer_premium"] = np.inf
-    sales.loc[4, "image_paths"] = "images/missing.jpg"
+    corrupt_image_path = dataset_dir / "images" / "SALE005" / "corrupt.jpg"
+    corrupt_image_path.write_text("not a JPEG")
+    sales.loc[4, "image_paths"] = "images/SALE005/corrupt.jpg"
     sales.to_csv(sales_path, index=False)
 
     clean, _ = prepare_sales_data(dataset_dir, processed_dir, repo_root)
