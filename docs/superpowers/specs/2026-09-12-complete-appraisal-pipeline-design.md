@@ -27,10 +27,12 @@ scraper is externally fragile and provides asking prices. The existing scraper
 will remain available, but completing the product will not depend on another
 live scrape.
 
-The prototype stays deliberately small: NumPy cosine search instead of FAISS,
-one cached CLIP model, the existing LightGBM quantile models, and Streamlit for
-the demo. Generated data and models remain local ignored artifacts and are
-rebuilt with one documented command.
+The prototype stays deliberately small: CSV/JSON/NPZ files instead of
+Parquet, NumPy cosine search instead of FAISS, one cached CLIP model, the
+existing LightGBM quantile models, and Streamlit for the demo. Generated data
+and models remain local ignored artifacts and are rebuilt with one documented
+command. Existing Parquet-only paths will be migrated; PyArrow will not be a
+runtime requirement.
 
 ## Data and Artifact Build
 
@@ -40,7 +42,7 @@ existing canonical columns, validate its referenced images, remove invalid
 prices and 1st/99th-percentile outliers, and create a deterministic grouped
 80/10/10 split. It will write:
 
-- `data/processed/listings_clean.parquet`
+- `data/processed/listings_clean.csv`
 - `data/processed/splits.json`
 
 Canonical mappings include `item_id → ad_id`,
@@ -52,10 +54,9 @@ the repository root.
 A single build command will then run the existing CLIP embedding/index stage,
 condition calibration, and quantile price training. It will produce:
 
-- `data/processed/embeddings.parquet`
 - `data/processed/listing_embeddings.npz`
 - `data/processed/comparables_index.npz`
-- `data/processed/condition_tags.parquet`
+- `data/processed/condition_tags.csv`
 - `data/processed/condition_calibration.json`
 - `artifacts/price_model/price_models.joblib`
 - `artifacts/price_model/price_metrics.json`
