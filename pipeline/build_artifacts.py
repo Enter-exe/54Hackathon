@@ -1,12 +1,9 @@
 """Build every processed-data and price-model artifact from repository inputs."""
 
 import argparse
+import importlib
 import os
 from pathlib import Path
-
-from modeling import train_price
-from pipeline import condition_assessment, extract_embeddings
-from pipeline.prepare_dataset import prepare_sales_data
 
 
 EXPECTED = {
@@ -27,9 +24,13 @@ def build_artifacts(repo_root: Path, n_estimators: int = 200) -> dict[str, Path]
     previous_directory = Path.cwd()
     try:
         os.chdir(repo_root)
+        prepare_dataset = importlib.import_module("pipeline.prepare_dataset")
+        extract_embeddings = importlib.import_module("pipeline.extract_embeddings")
+        condition_assessment = importlib.import_module("pipeline.condition_assessment")
+        train_price = importlib.import_module("modeling.train_price")
         data_dir = Path("data")
         processed_dir = data_dir / "processed"
-        prepare_sales_data(
+        prepare_dataset.prepare_sales_data(
             data_dir / "commercial_truck_sales_100", processed_dir, Path(".")
         )
         extract_embeddings.run(data_dir)

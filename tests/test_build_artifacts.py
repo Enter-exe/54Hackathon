@@ -1,8 +1,12 @@
 import json
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import joblib
 import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
 
 from pipeline.build_artifacts import build_artifacts
@@ -41,6 +45,59 @@ def _write_sales_fixture(dataset_dir, count=20):
     pd.DataFrame(rows).to_csv(dataset_dir / "truck_sales_100.csv", index=False)
 
 
+def _install_stage_fakes(monkeypatch, *, omit=None, calls=None):
+    calls = calls if calls is not None else []
+
+    def fake_embeddings(data_dir):
+        calls.append("embeddings")
+        processed_dir = data_dir / "processed"
+        np.savez(processed_dir / "listing_embeddings.npz", ad_ids=np.array(["SALE001"]), embeddings=np.zeros((1, 2)))
+        if omit != "comparables":
+            np.savez(
+                processed_dir / "comparables_index.npz",
+                embeddings=np.zeros((1, 2)),
+                ad_id=np.array(["SALE001"]),
+                price=np.array([10_000.0]),
+                year=np.array([2020]),
+                make_name=np.array(["Make"]),
+                model_name=np.array(["Model"]),
+            )
+
+    def fake_condition(data_dir):
+        calls.append("condition")
+        processed_dir = data_dir / "processed"
+        pd.DataFrame({"ad_id": ["SALE001"]}).to_csv(processed_dir / "condition_tags.csv", index=False)
+        if omit != "condition_calibration":
+            (processed_dir / "condition_calibration.json").write_text(json.dumps({"thresholds": {}}))
+
+    def fake_training(embeddings, listings, splits, out_dir, n_estimators):
+        calls.append("training")
+        assert n_estimators == 5
+        out_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"quantiles": [0.1, 0.5, 0.9], "models": {}}, out_dir / "price_models.joblib")
+        if omit != "price_metrics":
+            (out_dir / "price_metrics.json").write_text(json.dumps({"val": {}, "test": {}}))
+
+    monkeypatch.setitem(sys.modules, "pipeline.extract_embeddings", SimpleNamespace(run=fake_embeddings))
+    monkeypatch.setitem(sys.modules, "pipeline.condition_assessment", SimpleNamespace(run=fake_condition))
+    monkeypatch.setitem(sys.modules, "modeling.train_price", SimpleNamespace(run_training=fake_training))
+
+
+def test_import_does_not_load_native_ml_stages():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import pipeline.build_artifacts; "
+            "assert not {'pipeline.extract_embeddings', 'pipeline.condition_assessment', 'modeling.train_price'} & set(sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_build_artifacts_writes_and_returns_complete_contract(tmp_path, monkeypatch):
     """Removing a stage or its output must fail the one-command build contract."""
     repo_root = tmp_path / "repo"
@@ -49,39 +106,21 @@ def test_build_artifacts_writes_and_returns_complete_contract(tmp_path, monkeypa
     _write_sales_fixture(dataset_dir)
     calls = []
 
-    def fake_embeddings(data_dir):
-        calls.append("embeddings")
-        processed_dir = data_dir / "processed"
-        np.savez(processed_dir / "listing_embeddings.npz", ad_ids=np.array(["SALE001"]), embeddings=np.zeros((1, 2)))
-        np.savez(
-            processed_dir / "comparables_index.npz",
-            embeddings=np.zeros((1, 2)),
-            ad_id=np.array(["SALE001"]),
-            price=np.array([10_000.0]),
-            year=np.array([2020]),
-            make_name=np.array(["Make"]),
-            model_name=np.array(["Model"]),
-        )
-
-    def fake_condition(data_dir):
-        calls.append("condition")
-        processed_dir = data_dir / "processed"
-        pd.DataFrame({"ad_id": ["SALE001"]}).to_csv(processed_dir / "condition_tags.csv", index=False)
-        (processed_dir / "condition_calibration.json").write_text(json.dumps({"thresholds": {}}))
-
-    def fake_training(embeddings, listings, splits, out_dir, n_estimators):
-        calls.append("training")
-        assert n_estimators == 5
-        out_dir.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"quantiles": [0.1, 0.5, 0.9], "models": {}}, out_dir / "price_models.joblib")
-        (out_dir / "price_metrics.json").write_text(json.dumps({"val": {}, "test": {}}))
-
-    monkeypatch.setattr("pipeline.extract_embeddings.run", fake_embeddings)
-    monkeypatch.setattr("pipeline.condition_assessment.run", fake_condition)
-    monkeypatch.setattr("modeling.train_price.run_training", fake_training)
+    _install_stage_fakes(monkeypatch, calls=calls)
 
     outputs = build_artifacts(repo_root, n_estimators=5)
 
     assert set(outputs) == EXPECTED_NAMES
     assert all(path.exists() for path in outputs.values())
     assert calls == ["embeddings", "condition", "training"]
+
+
+def test_build_artifacts_rejects_missing_required_artifact(tmp_path, monkeypatch):
+    repo_root = tmp_path / "repo"
+    dataset_dir = repo_root / "data" / "commercial_truck_sales_100"
+    dataset_dir.mkdir(parents=True)
+    _write_sales_fixture(dataset_dir)
+    _install_stage_fakes(monkeypatch, omit="price_metrics")
+
+    with pytest.raises(RuntimeError, match="artifact build incomplete: \['price_metrics'\]"):
+        build_artifacts(repo_root, n_estimators=5)
