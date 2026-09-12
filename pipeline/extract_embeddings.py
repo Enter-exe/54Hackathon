@@ -22,6 +22,8 @@ import pandas as pd
 import torch
 from PIL import Image
 
+from pipeline.gating import build_gate, gate_mask
+
 MODEL_NAME = "ViT-B-32-quickgelu"  # matches OpenAI's original activation; plain ViT-B-32 mismatches quick_gelu and silently degrades embeddings
 PRETRAINED = "openai"
 
@@ -59,12 +61,18 @@ def embed_images(paths: list[str], model, preprocess, device: str, batch_size: i
     return np.concatenate(embs, axis=0) if embs else np.zeros((0, 512), dtype=np.float32)
 
 
-def pooled_listing_embedding(image_paths: list[str], model, preprocess, device: str) -> np.ndarray | None:
+def pooled_listing_embedding(image_paths: list[str], model, preprocess, device: str, gate=None) -> np.ndarray | None:
+    """gate: an optional pipeline.gating.PhotoGate. When given, images that
+    don't look like a real truck photo (placeholder/graphic) are excluded
+    before pooling, not just dropped for being unreadable."""
     valid_paths = [p for p in image_paths if Path(p).exists()]
     if not valid_paths:
         return None
     embs = embed_images(valid_paths, model, preprocess, device)
-    nonzero = embs[np.any(embs != 0, axis=1)]
+    keep_mask = np.any(embs != 0, axis=1)
+    if gate is not None:
+        keep_mask &= gate_mask(embs, gate)
+    nonzero = embs[keep_mask]
     if len(nonzero) == 0:
         return None
     pooled = nonzero.mean(axis=0)
@@ -89,13 +97,14 @@ def run(data_dir: Path) -> None:
 
     print(f"Loading {MODEL_NAME} ({PRETRAINED})...")
     model, preprocess = load_model(device)
+    gate = build_gate(model, device, MODEL_NAME)
 
     rows = []
     n = len(df)
     for i, row in enumerate(df.itertuples(), 1):
-        pooled = pooled_listing_embedding(row.image_paths, model, preprocess, device)
+        pooled = pooled_listing_embedding(row.image_paths, model, preprocess, device, gate=gate)
         if pooled is None:
-            print(f"WARN: no usable images for ad_id={row.ad_id}, skipping")
+            print(f"WARN: no usable (real-photo) images for ad_id={row.ad_id}, skipping")
             continue
         rows.append(
             {
@@ -114,6 +123,26 @@ def run(data_dir: Path) -> None:
     emb_df = pd.DataFrame(rows)
     emb_df.to_parquet(processed_dir / "embeddings.parquet", index=False)
     print(f"Wrote {processed_dir / 'embeddings.parquet'} ({len(emb_df)} listings)")
+
+    # Listings dropped here (no real-photo images survived the gate) must also come out of
+    # splits.json, or any consumer that cross-checks split coverage against the embeddings
+    # (e.g. modeling/train_price.py) will see a mismatch -- clean_split.py's hash-based
+    # placeholder check doesn't catch every case this gate does.
+    dropped_ids = set(df["ad_id"]) - set(emb_df["ad_id"])
+    if dropped_ids:
+        splits = {name: [a for a in ids if a not in dropped_ids] for name, ids in splits.items()}
+        with open(processed_dir / "splits.json", "w") as f:
+            json.dump(splits, f)
+        print(f"Pruned {len(dropped_ids)} listing(s) from splits.json (no usable real-photo images): {sorted(dropped_ids)}")
+
+    # All-split embedding cache for modeling/train_price.py (ad_ids/embeddings keys,
+    # every split included -- it does its own train/val/test filtering via splits.json).
+    np.savez(
+        processed_dir / "listing_embeddings.npz",
+        ad_ids=np.array(emb_df["ad_id"].astype(str).tolist()),  # fixed-width unicode, not object dtype -- train_price.py loads with allow_pickle=False
+        embeddings=np.stack(emb_df["embedding"].to_numpy()),
+    )
+    print(f"Wrote {processed_dir / 'listing_embeddings.npz'} ({len(emb_df)} listings)")
 
     train_df = emb_df[emb_df["split"] == "train"]
     train_embeddings = np.stack(train_df["embedding"].to_numpy())

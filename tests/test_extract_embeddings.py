@@ -77,7 +77,12 @@ def test_embed_images_skips_corrupt_file_without_crashing(model_and_preprocess, 
     assert np.allclose(result[1], 0.0)  # corrupt image left as the zero row, not dropped or crashed on
 
 
-def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path):
+def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatch):
+    # This test is about run()'s I/O/schema plumbing, not photo-realism judgment
+    # (that's test_gating.py's job) -- the synthetic solid-color fixture images
+    # correctly fail the real-photo gate, so bypass it here.
+    monkeypatch.setattr("pipeline.extract_embeddings.gate_mask", lambda embs, gate: np.ones(len(embs), dtype=bool))
+
     data_dir = tmp_path / "data"
     processed_dir = data_dir / "processed"
     processed_dir.mkdir(parents=True)
@@ -113,7 +118,7 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path):
     )
     listings.to_parquet(processed_dir / "listings_clean.parquet", index=False)
     with open(processed_dir / "splits.json", "w") as f:
-        json.dump({"train": [1], "val": [2], "test": []}, f)
+        json.dump({"train": [1], "val": [2], "test": [3]}, f)  # ad_id 3 will get dropped and must be pruned back out
 
     run(data_dir)
 
@@ -127,3 +132,14 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path):
 
     index = np.load(processed_dir / "comparables_index.npz", allow_pickle=True)
     assert list(index["ad_id"]) == [1]  # only the train-split listing goes into the comparables index
+
+    # all-split cache consumed by modeling/train_price.py
+    listing_cache = np.load(processed_dir / "listing_embeddings.npz", allow_pickle=False)
+    assert set(listing_cache["ad_ids"]) == {"1", "2"}
+    assert listing_cache["embeddings"].shape == (2, 512)
+
+    # ad_id 3 was dropped (no valid images) -- it must be pruned from splits.json too, or
+    # a consumer cross-checking split coverage against the embeddings (train_price.py) breaks
+    with open(processed_dir / "splits.json") as f:
+        pruned_splits = json.load(f)
+    assert pruned_splits == {"train": [1], "val": [2], "test": []}
