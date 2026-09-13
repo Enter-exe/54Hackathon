@@ -5,6 +5,7 @@ import socket
 from types import SimpleNamespace
 
 import pytest
+import requests
 from PIL import Image
 
 from pipeline.listing_images import (
@@ -12,6 +13,7 @@ from pipeline.listing_images import (
     download_images,
     extract_image_urls,
     extract_listing_images,
+    fetch_html,
     render_html_with_playwright,
     validate_public_url,
 )
@@ -77,6 +79,16 @@ def test_extracts_json_ld_with_media_type_parameters():
     """
     assert extract_image_urls(html, "https://example.com/listing") == [
         "https://example.com/structured.jpg"
+    ]
+
+
+def test_malformed_json_ld_does_not_hide_valid_open_graph_image():
+    html = """
+      <script type="application/ld+json">{not-json</script>
+      <meta property="og:image" content="/truck.jpg">
+    """
+    assert extract_image_urls(html, "https://example.com/listing") == [
+        "https://example.com/truck.jpg"
     ]
 
 
@@ -552,6 +564,63 @@ def test_download_images_rejects_truncated_image_data(tmp_path):
     assert warnings == ["Some listing images could not be used."]
 
 
+def test_download_images_rejects_oversized_content_length(tmp_path, monkeypatch):
+    monkeypatch.setattr("pipeline.listing_images.MAX_IMAGE_BYTES", 8)
+    response = FakeResponse(
+        200,
+        {"Content-Type": "image/jpeg", "Content-Length": "9"},
+        [b"123456789"],
+    )
+    paths, warnings = download_images(
+        ["https://images.example.com/truck.jpg"],
+        tmp_path,
+        http_get=lambda *args, **kwargs: response,
+        resolver=public_resolver,
+    )
+    assert paths == []
+    assert warnings == ["Some listing images could not be used."]
+
+
+def test_download_images_rejects_private_host_before_http(tmp_path):
+    requested = []
+
+    def resolver(host, port, type=socket.SOCK_STREAM):
+        return [(socket.AF_INET, type, 6, "", ("127.0.0.1", port))]
+
+    paths, warnings = download_images(
+        ["http://internal.example/truck.jpg"],
+        tmp_path,
+        http_get=lambda *args, **kwargs: requested.append(args[0]),
+        resolver=resolver,
+    )
+    assert requested == []
+    assert paths == []
+    assert warnings == ["Some listing images could not be used."]
+
+
+def test_download_images_revalidates_redirected_image_host(tmp_path):
+    requested = []
+
+    def resolver(host, port, type=socket.SOCK_STREAM):
+        address = "127.0.0.1" if host == "127.0.0.1" else "93.184.216.34"
+        return [(socket.AF_INET, type, 6, "", (address, port))]
+
+    response = FakeResponse(302, {"Location": "http://127.0.0.1/private.jpg"})
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return response
+
+    paths, _ = download_images(
+        ["https://images.example.com/truck.jpg"],
+        tmp_path,
+        http_get=get,
+        resolver=resolver,
+    )
+    assert requested == ["https://images.example.com/truck.jpg"]
+    assert paths == []
+
+
 def test_download_images_removes_partial_file_after_interrupted_write(
     monkeypatch, tmp_path
 ):
@@ -628,6 +697,27 @@ def test_extract_listing_images_returns_only_image_contract(tmp_path, monkeypatc
     assert set(result) == {"source_url", "source_host", "image_paths", "warnings"}
 
 
+def test_browser_failure_becomes_manual_upload_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "pipeline.listing_images.fetch_html",
+        lambda *args, **kwargs: ("https://example.com/truck", "<html></html>"),
+    )
+
+    def fail_renderer(url):
+        raise ListingExtractionError(
+            "browser_failed", "Automatic extraction failed; upload photos manually."
+        )
+
+    with pytest.raises(ListingExtractionError) as error:
+        extract_listing_images(
+            "https://example.com/truck",
+            tmp_path,
+            browser_renderer=fail_renderer,
+            resolver=public_resolver,
+        )
+    assert error.value.code == "browser_failed"
+
+
 def test_extract_listing_images_uses_browser_only_when_static_extraction_has_no_candidates(
     tmp_path, monkeypatch
 ):
@@ -668,8 +758,6 @@ def test_extract_listing_images_raises_when_no_valid_images_remain(
 
 
 def test_fetch_html_revalidates_redirect_targets():
-    from pipeline.listing_images import fetch_html
-
     responses = iter([
         FakeResponse(302, {"Location": "http://127.0.0.1/admin"}),
     ])
@@ -684,9 +772,45 @@ def test_fetch_html_revalidates_redirect_targets():
         )
 
 
-def test_fetch_html_rejects_oversized_body(monkeypatch):
-    from pipeline.listing_images import fetch_html
+def test_fetch_html_rejects_fourth_redirect():
+    responses = iter(
+        FakeResponse(302, {"Location": f"/redirect-{index}"})
+        for index in range(4)
+    )
+    with pytest.raises(ListingExtractionError) as error:
+        fetch_html(
+            "https://example.com/start",
+            http_get=lambda *args, **kwargs: next(responses),
+            resolver=public_resolver,
+        )
+    assert error.value.code == "redirect"
 
+
+@pytest.mark.parametrize("status", [401, 403, 429])
+def test_fetch_html_reports_access_blocks(status):
+    with pytest.raises(ListingExtractionError) as error:
+        fetch_html(
+            "https://example.com/truck",
+            http_get=lambda *args, **kwargs: FakeResponse(status),
+            resolver=public_resolver,
+        )
+    assert error.value.code == "blocked"
+
+
+def test_fetch_html_converts_request_timeout():
+    def timeout(*args, **kwargs):
+        raise requests.Timeout("slow")
+
+    with pytest.raises(ListingExtractionError) as error:
+        fetch_html(
+            "https://example.com/truck",
+            http_get=timeout,
+            resolver=public_resolver,
+        )
+    assert error.value.code == "unavailable"
+
+
+def test_fetch_html_rejects_oversized_body(monkeypatch):
     monkeypatch.setattr("pipeline.listing_images.MAX_HTML_BYTES", 8)
     response = FakeResponse(chunks=[b"123456", b"789"])
 
@@ -699,8 +823,6 @@ def test_fetch_html_rejects_oversized_body(monkeypatch):
 
 
 def test_fetch_html_rejects_malformed_content_length():
-    from pipeline.listing_images import fetch_html
-
     response = FakeResponse(headers={"Content-Type": "text/html", "Content-Length": "unknown"})
 
     with pytest.raises(ListingExtractionError, match="size"):
@@ -712,8 +834,6 @@ def test_fetch_html_rejects_malformed_content_length():
 
 
 def test_fetch_html_does_not_append_chunk_past_limit(monkeypatch):
-    from pipeline.listing_images import fetch_html
-
     monkeypatch.setattr("pipeline.listing_images.MAX_HTML_BYTES", 8)
     response = FakeResponse(chunks=[b"123456789"])
 
@@ -726,8 +846,6 @@ def test_fetch_html_does_not_append_chunk_past_limit(monkeypatch):
 
 
 def test_fetch_html_returns_final_url_and_decoded_html():
-    from pipeline.listing_images import fetch_html
-
     response = FakeResponse(chunks=[b"<html>truck</html>"])
     assert fetch_html(
         "https://example.com/truck",

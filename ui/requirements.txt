@@ -1,1 +1,10 @@
 streamlit
+requests
+Pillow
+joblib
+lightgbm
+numpy
+pandas
+scikit-learn
+torch
+open_clip_torch

@@ -26,3 +26,20 @@ for the source notes and field details.
 Use `truck_sales_100.csv` as the tabular index, matching each row's `item_id`
 to its folder in `images/`. Keep all images from a listing together when
 creating train, validation, and test splits to prevent leakage.
+
+## Running the demo
+
+Install the UI/model dependencies and start Streamlit from the repository root:
+
+```bash
+python -m pip install -r ui/requirements.txt
+streamlit run ui/app.py
+```
+
+The app accepts either uploaded truck photos or a public listing URL. URL
+appraisal extracts photos only; asking prices and current bids are not model
+inputs. Purple Wave and Commercial Truck Trader receive dedicated parsing,
+with generic structured-image extraction for other public listing pages.
+Pages blocked by authentication, CAPTCHA, or bot protection fall back to
+manual photo upload. Run the data/model pipeline first when generated
+artifacts are not already present.
