@@ -29,17 +29,38 @@ creating train, validation, and test splits to prevent leakage.
 
 ## Running the demo
 
-Install the UI/model dependencies and start Streamlit from the repository root:
+Install the deployed UI/model dependencies and start Streamlit from the
+repository root:
 
 ```bash
 python -m pip install -r ui/requirements.txt
 streamlit run ui/app.py
 ```
 
+For a fresh setup without generated model artifacts, install the separate
+pipeline and training dependencies (including `pyarrow`), then build the
+artifacts before starting Streamlit:
+
+```bash
+python -m pip install -r pipeline/requirements.txt -r modeling/requirements.txt
+python pipeline/clean_split.py
+python -m pipeline.extract_embeddings
+python -m pipeline.condition_assessment
+python -m modeling.train_price
+```
+
+Browser rendering for JavaScript-only listing pages is optional. Enable it by
+installing the scraper dependencies and Chromium:
+
+```bash
+python -m pip install -r scraper/requirements.txt
+python -m playwright install chromium
+```
+
 The app accepts either uploaded truck photos or a public listing URL. URL
 appraisal extracts photos only; asking prices and current bids are not model
 inputs. Purple Wave and Commercial Truck Trader receive dedicated parsing,
 with generic structured-image extraction for other public listing pages.
-Pages blocked by authentication, CAPTCHA, or bot protection fall back to
-manual photo upload. Run the data/model pipeline first when generated
-artifacts are not already present.
+Without the optional browser renderer, JavaScript-only pages—and pages blocked
+by authentication, CAPTCHA, or bot protection—fall back to manual photo
+upload.
