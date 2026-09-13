@@ -43,6 +43,9 @@ LISTING_ERROR_MESSAGES = {
     "browser_unavailable": "Automatic browser extraction is unavailable.",
     "browser_failed": "We couldn't render that listing automatically.",
 }
+GENERIC_LISTING_ERROR_MESSAGE = (
+    "We couldn't extract photos from that listing automatically."
+)
 
 st.set_page_config(page_title="What's This Truck Worth?", page_icon="🚚", layout="centered")
 
@@ -63,7 +66,7 @@ def appraise_listing_url(
 
 
 def listing_error_message(error: ListingExtractionError) -> str:
-    return LISTING_ERROR_MESSAGES.get(error.code, str(error))
+    return LISTING_ERROR_MESSAGES.get(error.code, GENERIC_LISTING_ERROR_MESSAGE)
 
 
 def save_uploads(uploaded_files, tmp_dir: Path) -> list[str]:
