@@ -20,14 +20,16 @@ from pipeline.gate_images import gate_images
 PRICE_MODEL_PATH = Path("artifacts/price_model/price_models.joblib")
 CALIBRATION_PATH = Path("data/processed/condition_calibration.json")
 COMPARABLES_INDEX_PATH = Path("data/processed/comparables_index.npz")
-SPEC_CLASSIFIER_PATH = Path("artifacts/spec_classifier/make_classifier.joblib")
+MAKE_CLASSIFIER_PATH = Path("artifacts/spec_classifier/make_classifier.joblib")
+CLASS_CLASSIFIER_PATH = Path("artifacts/spec_classifier/class_classifier.joblib")
 
 
 def load_resources(
     price_model_path: Path = PRICE_MODEL_PATH,
     calibration_path: Path = CALIBRATION_PATH,
     comparables_index_path: Path = COMPARABLES_INDEX_PATH,
-    spec_classifier_path: Path = SPEC_CLASSIFIER_PATH,
+    make_classifier_path: Path = MAKE_CLASSIFIER_PATH,
+    class_classifier_path: Path = CLASS_CLASSIFIER_PATH,
 ):
     if not Path(price_model_path).exists():
         return None
@@ -37,7 +39,8 @@ def load_resources(
     bundle = joblib.load(price_model_path)
     calibration = json.loads(Path(calibration_path).read_text()) if Path(calibration_path).exists() else None
     comparables_index = np.load(comparables_index_path, allow_pickle=True) if Path(comparables_index_path).exists() else None
-    spec_classifier = joblib.load(spec_classifier_path) if Path(spec_classifier_path).exists() else None
+    make_classifier = joblib.load(make_classifier_path) if Path(make_classifier_path).exists() else None
+    class_classifier = joblib.load(class_classifier_path) if Path(class_classifier_path).exists() else None
     return {
         "device": device,
         "model": model,
@@ -46,8 +49,16 @@ def load_resources(
         "bundle": bundle,
         "calibration": calibration,
         "comparables_index": comparables_index,
-        "spec_classifier": spec_classifier,
+        "make_classifier": make_classifier,
+        "class_classifier": class_classifier,
     }
+
+
+def _predict_top_k(pooled_embedding: np.ndarray, spec_classifier: dict, label_key: str, top_k: int) -> list[dict]:
+    clf, encoder = spec_classifier["classifier"], spec_classifier["label_encoder"]
+    probs = clf.predict_proba(pooled_embedding.reshape(1, -1))[0]
+    order = np.argsort(-probs)[:top_k]
+    return [{label_key: encoder.classes_[i], "probability": float(probs[i])} for i in order]
 
 
 def predict_make(pooled_embedding: np.ndarray, spec_classifier: dict, top_k: int = 2) -> list[dict]:
@@ -57,11 +68,26 @@ def predict_make(pooled_embedding: np.ndarray, spec_classifier: dict, top_k: int
     falsely-confident guess when two makes look genuinely similar (e.g. Ford
     Econoline vs Chevrolet Express, both full-size cutaway vans -- a real
     reported miss that motivated adding this).
+
+    Known limitation, also found via real testing: "make" itself can span
+    visually unrelated body styles (a Ford Econoline van vs a Ford F-750
+    conventional-cab truck look nothing alike), so this is confidently wrong
+    for brands whose lineup is dominated by one body style in the training
+    data. predict_gvwr_class() is the more robust fallback for exactly that
+    case -- vehicle size/class is a consistent visual signal regardless of
+    badge.
     """
-    clf, encoder = spec_classifier["classifier"], spec_classifier["label_encoder"]
-    probs = clf.predict_proba(pooled_embedding.reshape(1, -1))[0]
-    order = np.argsort(-probs)[:top_k]
-    return [{"make_name": encoder.classes_[i], "probability": float(probs[i])} for i in order]
+    return _predict_top_k(pooled_embedding, spec_classifier, "make_name", top_k)
+
+
+def predict_gvwr_class(pooled_embedding: np.ndarray, spec_classifier: dict, top_k: int = 2) -> list[dict]:
+    """Trained GVWR weight-class prediction (e.g. "CLASS 6 (GVW 19501 - 26000)").
+    70% accuracy on held-out data, with softer failure modes than make: it
+    confuses adjacent weight classes, not unrelated vehicle shapes, because
+    class correlates directly with visible vehicle size/proportions rather
+    than a brand badge that can span multiple body styles.
+    """
+    return _predict_top_k(pooled_embedding, spec_classifier, "class_name", top_k)
 
 
 def find_comparables(pooled_embedding: np.ndarray, comparables_index, k: int = 3) -> list[dict]:
@@ -92,15 +118,22 @@ def find_comparables(pooled_embedding: np.ndarray, comparables_index, k: int = 3
 
 def run_appraisal(paths: list[str], resources: dict) -> dict:
     """Runs the full pipeline on a listing's photos: gate -> embed -> condition
-    -> price -> comparables -> predicted make. Returns {"gate", "condition",
-    "price", "comparables", "predicted_make"}, with the latter four None when
-    the gate rejects all photos.
+    -> price -> comparables -> predicted make/class. Returns {"gate",
+    "condition", "price", "comparables", "predicted_make", "predicted_class"},
+    with the latter five None when the gate rejects all photos.
     """
     device, model, preprocess = resources["device"], resources["model"], resources["preprocess"]
     gate_result = gate_images(paths, model, preprocess, device)
 
     if not gate_result["accepted"]:
-        return {"gate": gate_result, "condition": None, "price": None, "comparables": None, "predicted_make": None}
+        return {
+            "gate": gate_result,
+            "condition": None,
+            "price": None,
+            "comparables": None,
+            "predicted_make": None,
+            "predicted_class": None,
+        }
 
     usable_paths = gate_result["usable_paths"]
     embs = embed_images(usable_paths, model, preprocess, device)
@@ -126,7 +159,10 @@ def run_appraisal(paths: list[str], resources: dict) -> dict:
         find_comparables(pooled, resources["comparables_index"]) if resources["comparables_index"] is not None else None
     )
     predicted_make_result = (
-        predict_make(pooled, resources["spec_classifier"]) if resources["spec_classifier"] is not None else None
+        predict_make(pooled, resources["make_classifier"]) if resources["make_classifier"] is not None else None
+    )
+    predicted_class_result = (
+        predict_gvwr_class(pooled, resources["class_classifier"]) if resources["class_classifier"] is not None else None
     )
 
     return {
@@ -135,4 +171,5 @@ def run_appraisal(paths: list[str], resources: dict) -> dict:
         "price": price_result,
         "comparables": comparables_result,
         "predicted_make": predicted_make_result,
+        "predicted_class": predicted_class_result,
     }

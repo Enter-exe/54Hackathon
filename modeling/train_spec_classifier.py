@@ -1,4 +1,5 @@
-"""Train a make classifier on the same frozen CLIP embeddings used for pricing.
+"""Train a spec classifier (make, or GVWR class) on the same frozen CLIP
+embeddings used for pricing.
 
 Motivation: the UI's "predicted specs" originally used a raw nearest-neighbor
 lookup against comparables_index.npz, which measured ~50% make-accuracy on
@@ -8,6 +9,18 @@ real, reported misclassification. A trained, class-weighted classifier can
 learn an actual decision boundary between such classes instead of just
 trusting whichever single training example happens to be nearest in
 embedding space.
+
+The make classifier alone (87.6% accuracy) turned out to have a real,
+structural limitation of its own: a live-tested 2026 Ford F-750 was
+misclassified as Chevrolet, because "FORD" in the training data is 53%
+Econoline vans and only ~17% heavier conventional-cab trucks (F-650/F-750)
+-- two visually unrelated body styles sharing one brand label, and the
+model naturally learned the majority shape. GVWR class_name doesn't have
+that problem: it's a direct, visually consistent proxy for vehicle size/
+body style regardless of brand, and scores 70% accuracy with much softer
+errors (confusing adjacent weight classes, not unrelated vehicle shapes).
+Both classifiers are trained and shown -- make when it's reliable, class
+as a more robust fallback signal.
 
 Logistic regression (not LightGBM) on top of frozen CLIP embeddings is the
 standard "linear probe" approach -- CLIP's embedding space is specifically
@@ -53,7 +66,7 @@ def load_data(embeddings_path, listings_path, splits_path, label_column="make_na
     return embeddings, labels, split_arr
 
 
-def train_and_evaluate(embeddings, labels, split_arr, out_dir, min_class_count=5, C=100.0):
+def train_and_evaluate(embeddings, labels, split_arr, out_dir, min_class_count=5, C=100.0, artifact_prefix="make"):
     train_mask = split_arr == "train"
     test_mask = split_arr == "test"
 
@@ -90,9 +103,9 @@ def train_and_evaluate(embeddings, labels, split_arr, out_dir, min_class_count=5
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"classifier": clf, "label_encoder": encoder}, out_dir / "make_classifier.joblib")
-    (out_dir / "make_classifier_metrics.json").write_text(json.dumps(metrics, indent=2))
-    (out_dir / "make_classifier_report.txt").write_text(report)
+    joblib.dump({"classifier": clf, "label_encoder": encoder}, out_dir / f"{artifact_prefix}_classifier.joblib")
+    (out_dir / f"{artifact_prefix}_classifier_metrics.json").write_text(json.dumps(metrics, indent=2))
+    (out_dir / f"{artifact_prefix}_classifier_report.txt").write_text(report)
     return metrics, report
 
 
@@ -104,10 +117,14 @@ def main():
     ap.add_argument("--out-dir", default="artifacts/spec_classifier")
     ap.add_argument("--min-class-count", type=int, default=5)
     ap.add_argument("--C", type=float, default=100.0)
+    ap.add_argument("--label-column", default="make_name")
+    ap.add_argument("--artifact-prefix", default="make")
     args = ap.parse_args()
 
-    embeddings, labels, split_arr = load_data(args.embeddings, args.listings, args.splits)
-    metrics, report = train_and_evaluate(embeddings, labels, split_arr, args.out_dir, args.min_class_count, args.C)
+    embeddings, labels, split_arr = load_data(args.embeddings, args.listings, args.splits, args.label_column)
+    metrics, report = train_and_evaluate(
+        embeddings, labels, split_arr, args.out_dir, args.min_class_count, args.C, args.artifact_prefix
+    )
     print(json.dumps(metrics, indent=2))
     print(report)
 

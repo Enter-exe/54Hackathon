@@ -80,18 +80,33 @@ def render_condition(condition_result: dict) -> None:
     st.caption("Flags mean this truck looks worse than about 80% of comparable listings on that attribute — not a guarantee of damage.")
 
 
-def render_predicted_make(predicted_make_result: list[dict] | None) -> None:
-    st.subheader("Predicted make")
+def render_predicted_specs(predicted_class_result: list[dict] | None, predicted_make_result: list[dict] | None) -> None:
+    st.subheader("Predicted specs")
 
-    if not predicted_make_result:
+    if predicted_class_result:
+        top, runner_up = predicted_class_result[0], predicted_class_result[1] if len(predicted_class_result) > 1 else None
+        label = top["class_name"].split("(")[0].strip().title()
+        st.markdown(f"**Weight class: {label}** ({top['probability']:.0%} confidence)")
+        if runner_up and runner_up["probability"] >= 0.25:
+            runner_label = runner_up["class_name"].split("(")[0].strip().title()
+            st.caption(f"Close call — could also be {runner_label} ({runner_up['probability']:.0%}).")
+    else:
+        st.caption("No trained weight-class classifier available.")
+
+    if predicted_make_result:
+        top, runner_up = predicted_make_result[0], predicted_make_result[1] if len(predicted_make_result) > 1 else None
+        st.markdown(f"**Make: {top['make_name'].title()}** ({top['probability']:.0%} confidence)")
+        if runner_up and runner_up["probability"] >= 0.25:
+            st.caption(f"Close call — could also be {runner_up['make_name'].title()} ({runner_up['probability']:.0%}).")
+    else:
         st.caption("No trained make classifier available.")
-        return
 
-    top, runner_up = predicted_make_result[0], predicted_make_result[1] if len(predicted_make_result) > 1 else None
-    st.markdown(f"**{top['make_name'].title()}** ({top['probability']:.0%} confidence)")
-    if runner_up and runner_up["probability"] >= 0.25:
-        st.caption(f"Close call — could also be {runner_up['make_name'].title()} ({runner_up['probability']:.0%}).")
-    st.caption("From a trained classifier (logistic regression on the same image embeddings), not a lookup.")
+    st.caption(
+        "Both are trained classifiers (logistic regression on the same image embeddings), not a lookup. "
+        "Weight class tends to be more reliable — it tracks visible vehicle size, whereas a make's lineup can span "
+        "very different-looking body styles (e.g. a van-based cutaway vs. a heavy conventional-cab truck), which "
+        "make prediction can get confidently wrong when a brand is dominated in the training data by one shape."
+    )
     st.caption(
         "Model/year aren't predicted here — there isn't enough training data per model to classify those "
         "reliably yet. The closest real match's model/year shows up in \"Why this price\" below as reference, not a claim."
@@ -150,7 +165,7 @@ def main():
         return
 
     render_price(result["price"])
-    render_predicted_make(result["predicted_make"])
+    render_predicted_specs(result["predicted_class"], result["predicted_make"])
     render_condition(result["condition"])
     render_comparables(result["comparables"])
 

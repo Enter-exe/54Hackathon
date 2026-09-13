@@ -11,7 +11,14 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from ui.appraisal import PRICE_MODEL_PATH, find_comparables, load_resources, predict_make, run_appraisal
+from ui.appraisal import (
+    PRICE_MODEL_PATH,
+    find_comparables,
+    load_resources,
+    predict_gvwr_class,
+    predict_make,
+    run_appraisal,
+)
 
 pytestmark = pytest.mark.skipif(
     not PRICE_MODEL_PATH.exists(), reason="trained price model not present; run the pipeline scripts first"
@@ -39,6 +46,7 @@ def test_run_appraisal_rejects_dark_photo_without_touching_price_model(resources
     assert result["price"] is None
     assert result["comparables"] is None
     assert result["predicted_make"] is None
+    assert result["predicted_class"] is None
 
 
 def test_run_appraisal_full_pipeline_on_a_real_listing_photo(resources):
@@ -65,10 +73,16 @@ def test_run_appraisal_full_pipeline_on_a_real_listing_photo(resources):
     sims = [c["similarity"] for c in result["comparables"]]
     assert sims == sorted(sims, reverse=True)
 
-    if resources["spec_classifier"] is not None:
+    if resources["make_classifier"] is not None:
         assert result["predicted_make"] is not None
         assert len(result["predicted_make"]) == 2
         probs = [m["probability"] for m in result["predicted_make"]]
+        assert probs == sorted(probs, reverse=True)
+
+    if resources["class_classifier"] is not None:
+        assert result["predicted_class"] is not None
+        assert len(result["predicted_class"]) == 2
+        probs = [m["probability"] for m in result["predicted_class"]]
         assert probs == sorted(probs, reverse=True)
 
 
@@ -85,11 +99,23 @@ def test_find_comparables_returns_k_nearest_by_cosine_similarity(resources):
 
 
 def test_predict_make_returns_probabilities_summing_towards_one(resources):
-    if resources["spec_classifier"] is None:
-        pytest.skip("no trained spec classifier present")
+    if resources["make_classifier"] is None:
+        pytest.skip("no trained make classifier present")
     query = resources["comparables_index"]["embeddings"][0]
 
-    results = predict_make(query, resources["spec_classifier"], top_k=2)
+    results = predict_make(query, resources["make_classifier"], top_k=2)
+
+    assert len(results) == 2
+    assert all(0.0 <= r["probability"] <= 1.0 for r in results)
+    assert results[0]["probability"] >= results[1]["probability"]
+
+
+def test_predict_gvwr_class_returns_probabilities_summing_towards_one(resources):
+    if resources["class_classifier"] is None:
+        pytest.skip("no trained class classifier present")
+    query = resources["comparables_index"]["embeddings"][0]
+
+    results = predict_gvwr_class(query, resources["class_classifier"], top_k=2)
 
     assert len(results) == 2
     assert all(0.0 <= r["probability"] <= 1.0 for r in results)
