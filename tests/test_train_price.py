@@ -9,13 +9,12 @@ import numpy as np
 import pandas as pd
 
 from modeling.train_price import (
-    apply_margin,
-    compute_calibration_margin,
+    compute_calibration_bounds,
     evaluate,
     load_training_data,
-    predict_quantiles,
+    predict_range,
     run_training,
-    train_models,
+    train_median_model,
 )
 
 
@@ -124,11 +123,13 @@ class TrainingDataTests(unittest.TestCase):
 
         bundle = joblib.load(output_dir / "price_models.joblib")
         saved_metrics = json.loads((output_dir / "price_metrics.json").read_text())
-        self.assertEqual(bundle["quantiles"], [0.1, 0.5, 0.9])
-        self.assertEqual(set(bundle["models"]), {0.1, 0.5, 0.9})
-        self.assertIsInstance(bundle["calibration_margin"], float)
+        self.assertIn("model", bundle)
+        # sign isn't guaranteed with only 2 calibration points (this fixture's val
+        # split) -- see CalibrationTests below for the sign check with real data.
+        self.assertTrue(np.isfinite(bundle["rel_lo"]))
+        self.assertTrue(np.isfinite(bundle["rel_hi"]))
         self.assertEqual(saved_metrics, metrics)
-        self.assertEqual(set(metrics), {"val", "test", "calibration_margin"})
+        self.assertEqual(set(metrics), {"val", "test", "rel_lo", "rel_hi"})
 
     def test_run_training_accepts_condition_tags(self):
         output_dir = self.root / "artifacts"
@@ -143,20 +144,21 @@ class TrainingDataTests(unittest.TestCase):
             condition_tags_path=condition_path,
         )
 
-        self.assertEqual(set(metrics), {"val", "test", "calibration_margin"})
+        self.assertEqual(set(metrics), {"val", "test", "rel_lo", "rel_hi"})
 
 
 class PriceModelTests(unittest.TestCase):
-    def test_quantile_models_produce_ordered_predictions_and_metrics(self):
+    def test_median_model_produces_ordered_range_predictions_and_metrics(self):
         generator = np.random.default_rng(0)
         X = generator.normal(size=(60, 4))
         y = 20_000 + 4_000 * X[:, 0] - 2_000 * X[:, 1]
+        y = np.abs(y) + 5_000  # keep strictly positive: relative bounds require it
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            models = train_models(X[:50], y[:50], n_estimators=20)
-        predictions = predict_quantiles(models, X[50:])
-        metrics = evaluate(models, X[50:], y[50:])
+            model = train_median_model(X[:50], y[:50], n_estimators=20)
+        predictions = predict_range(model, X[50:], rel_lo=-0.2, rel_hi=0.3)
+        metrics = evaluate(model, X[50:], y[50:], rel_lo=-0.2, rel_hi=0.3)
 
         self.assertEqual(predictions.shape, (10, 3))
         self.assertTrue(np.all(predictions[:, 0] <= predictions[:, 1]))
@@ -174,40 +176,55 @@ class PriceModelTests(unittest.TestCase):
         )
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 
+    def test_predict_range_scales_with_the_prediction_not_a_fixed_dollar_amount(self):
+        """The whole point of the relative-bounds redesign: a truck predicted
+        at $100k should get a much wider dollar range than one predicted at
+        $10k, for the same rel_lo/rel_hi -- unlike a fixed additive margin."""
+        generator = np.random.default_rng(3)
+        X = generator.normal(size=(60, 3))
+        y = 10_000 + 500 * np.abs(X[:, 0]) + 200 * np.arange(60)  # wide, positive, spread out
+        model = train_median_model(X, y, n_estimators=20)
+
+        cheap_row = X[np.argmin(model.predict(X))].reshape(1, -1)
+        expensive_row = X[np.argmax(model.predict(X))].reshape(1, -1)
+
+        cheap_pred = predict_range(model, cheap_row, rel_lo=-0.3, rel_hi=0.3)[0]
+        expensive_pred = predict_range(model, expensive_row, rel_lo=-0.3, rel_hi=0.3)[0]
+
+        cheap_width = cheap_pred[2] - cheap_pred[0]
+        expensive_width = expensive_pred[2] - expensive_pred[0]
+        self.assertGreater(expensive_width, cheap_width)
+
 
 class CalibrationTests(unittest.TestCase):
-    def test_apply_margin_widens_lower_and_upper_only(self):
-        predictions = np.array([[10.0, 20.0, 30.0], [100.0, 200.0, 300.0]])
-
-        widened = apply_margin(predictions, margin=5.0)
-
-        np.testing.assert_array_equal(widened, [[5.0, 20.0, 35.0], [95.0, 200.0, 305.0]])
-
-    def test_compute_calibration_margin_returns_a_finite_float(self):
-        # A negative (narrowing) margin is valid CQR output when the raw quantile
-        # regressors already over-cover on held-out data -- not asserting a sign here.
+    def test_compute_calibration_bounds_returns_finite_floats_straddling_zero(self):
         generator = np.random.default_rng(1)
         X = generator.normal(size=(80, 4))
         y = 20_000 + 4_000 * X[:, 0]
-        models = train_models(X[:60], y[:60], n_estimators=20)
+        y = np.abs(y) + 5_000
+        model = train_median_model(X[:60], y[:60], n_estimators=20)
 
-        margin = compute_calibration_margin(models, X[60:], y[60:], target_coverage=0.8)
+        rel_lo, rel_hi = compute_calibration_bounds(model, X[60:], y[60:], target_coverage=0.8)
 
-        self.assertIsInstance(margin, float)
-        self.assertTrue(np.isfinite(margin))
+        self.assertTrue(np.isfinite(rel_lo))
+        self.assertTrue(np.isfinite(rel_hi))
+        self.assertLessEqual(rel_lo, 0.0)
+        self.assertGreaterEqual(rel_hi, 0.0)
 
-    def test_calibration_margin_raises_calibration_set_coverage_to_target(self):
-        """The whole point of CQR: applying the margin to the SAME data it was
-        computed from must hit at least the target coverage, by construction."""
+    def test_calibration_bounds_raise_calibration_set_coverage_to_target(self):
+        """The whole point of conformal calibration: applying the bounds to
+        the SAME data they were computed from must hit at least the target
+        coverage, by construction."""
         generator = np.random.default_rng(2)
         X = generator.normal(size=(100, 4))
-        y = 20_000 + 4_000 * X[:, 0] - 1_500 * X[:, 1] ** 2  # nonlinear -> raw quantiles undercover
-        models = train_models(X[:70], y[:70], n_estimators=20)
+        y = 20_000 + 4_000 * X[:, 0] - 1_500 * X[:, 1] ** 2  # nonlinear -> raw predictions undercover
+        y = np.abs(y) + 5_000
+        model = train_median_model(X[:70], y[:70], n_estimators=20)
         X_cal, y_cal = X[70:], y[70:]
 
-        raw_coverage = evaluate(models, X_cal, y_cal, margin=0.0)["interval_coverage"]
-        margin = compute_calibration_margin(models, X_cal, y_cal, target_coverage=0.8)
-        calibrated_coverage = evaluate(models, X_cal, y_cal, margin=margin)["interval_coverage"]
+        raw_coverage = evaluate(model, X_cal, y_cal, rel_lo=0.0, rel_hi=0.0)["interval_coverage"]
+        rel_lo, rel_hi = compute_calibration_bounds(model, X_cal, y_cal, target_coverage=0.8)
+        calibrated_coverage = evaluate(model, X_cal, y_cal, rel_lo=rel_lo, rel_hi=rel_hi)["interval_coverage"]
 
         self.assertGreaterEqual(calibrated_coverage, 0.8)
         self.assertGreaterEqual(calibrated_coverage, raw_coverage)

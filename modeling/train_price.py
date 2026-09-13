@@ -1,5 +1,26 @@
-"""Train quantile price models from cached listing-level image embeddings."""
+"""Train a price model from cached listing-level image embeddings.
 
+Only a median (q=0.5) LightGBM model is trained. Separate q10/q90 quantile
+regressors were tried first and dropped: with ~700 training rows, extreme
+quantile regression is poorly conditioned and regresses toward the global
+marginal quantile almost regardless of the specific truck. On the real test
+split, the raw q10 model's predictions had std=$5,474 across all trucks
+(vs the median model's std=$15,301) -- e.g. a real $118,751 truck got a raw
+q10 of $40,550 (34% of its true price), and a real $14,995 truck got a raw
+q90 of $79,661 (5x its true price). Loosening the tail models' regularization
+made this WORSE, not better (verified): a noisier tail fit needs a bigger
+CQR correction to still hit target coverage, so the final interval got wider,
+not more sensibly shaped.
+
+Instead, the low/high bounds are derived from the median model's OWN
+calibrated relative error (see compute_calibration_bounds): "on held-out
+data, how far off was this model, as a fraction of its own prediction."
+Applying that fraction multiplicatively means a truck's range scales with
+ITS predicted value instead of sitting near a fixed dollar floor/ceiling
+learned from the whole fleet -- which is what was making the low end look
+obviously wrong specifically for expensive trucks (and the high end
+obviously wrong for cheap ones).
+"""
 import argparse
 import json
 from pathlib import Path
@@ -12,7 +33,6 @@ from sklearn.metrics import mean_absolute_error, mean_pinball_loss, r2_score
 
 
 SPLIT_NAMES = ("train", "val", "test")
-QUANTILES = (0.1, 0.5, 0.9)
 CONDITION_COLUMNS = ("rust_prob", "body_damage_prob", "tire_wear_prob", "interior_wear_prob")
 
 
@@ -102,59 +122,72 @@ def load_training_data(embeddings_path, listings_path, splits_path, condition_ta
     }
 
 
-def train_models(X, y, n_estimators=200):
-    """Fit one LightGBM regressor for each requested price quantile."""
-    return {
-        quantile: LGBMRegressor(
-            objective="quantile",
-            alpha=quantile,
-            n_estimators=n_estimators,
-            learning_rate=0.05,
-            max_depth=4,
-            num_leaves=15,
-            min_child_samples=5,
-            reg_lambda=1.0,
-            random_state=0,
-            n_jobs=1,
-            verbosity=-1,
-        ).fit(X, y)
-        for quantile in QUANTILES
-    }
+def train_median_model(X, y, n_estimators=200):
+    """Fit the single LightGBM regressor the price range is built from."""
+    return LGBMRegressor(
+        objective="quantile",
+        alpha=0.5,
+        n_estimators=n_estimators,
+        learning_rate=0.05,
+        max_depth=4,
+        num_leaves=15,
+        min_child_samples=5,
+        reg_lambda=1.0,
+        random_state=0,
+        n_jobs=1,
+        verbosity=-1,
+    ).fit(X, y)
 
 
-def predict_quantiles(models, X):
-    """Return non-crossing q10, q50, and q90 predictions."""
-    predictions = np.column_stack([models[q].predict(X) for q in QUANTILES])
-    return np.sort(predictions, axis=1)
+def predict_median(model, X):
+    return model.predict(X)
 
 
-def compute_calibration_margin(models, X, y, target_coverage=0.8):
-    """Conformalized-quantile-regression correction (Romano et al. 2019): how
-    much to widen (or narrow) the [q10, q90] interval so it actually achieves
-    target_coverage on held-out data, instead of trusting the raw quantile
-    regressors' calibration. Measured need: the uncorrected interval was
-    hitting ~63-68% empirical coverage against an 80% nominal target.
-
-    Must be computed on a split the models were not trained on (val), then
-    applied to any other split (val for a calibrated read of held-out
-    performance, test for the real held-out check) -- applying it to the
-    same data it was fit on would trivially inflate coverage.
-    """
-    lower, _, upper = predict_quantiles(models, X).T
-    scores = np.maximum(lower - y, y - upper)
-    n = len(y)
-    q_level = min(1.0, np.ceil((n + 1) * target_coverage) / n)
+def _finite_sample_quantile(scores, q, n):
+    """The +1/n correction that makes a split-conformal quantile a valid
+    finite-sample bound (Romano et al. 2019) rather than a plain empirical
+    quantile, which would systematically undercover on small calibration
+    sets."""
+    q_level = min(1.0, np.ceil((n + 1) * q) / n)
     return float(np.quantile(scores, q_level, method="higher"))
 
 
-def apply_margin(predictions, margin):
-    lower, median, upper = predictions.T
-    return np.column_stack([lower - margin, median, upper + margin])
+def compute_calibration_bounds(model, X, y, target_coverage=0.8):
+    """Asymmetric, relative split-conformal calibration: measures how far
+    off the median model's predictions typically are, AS A FRACTION OF THE
+    PREDICTION ITSELF, on held-out data -- then reuses those two fractions
+    (below/above) as multiplicative bounds at inference. Must be computed on
+    a split the model was not trained on (val), then applied to any other
+    split (val for a calibrated read of held-out performance, test for the
+    real held-out check) -- applying it to the same data it was fit on
+    would trivially inflate coverage.
+
+    Returns (rel_lo, rel_hi): rel_lo <= 0 <= rel_hi, applied as
+    prediction * (1 + rel_lo) and prediction * (1 + rel_hi).
+    """
+    median_pred = predict_median(model, X)
+    if np.any(median_pred <= 0):
+        raise ValueError("median predictions must be positive to compute relative bounds")
+    relative_error = (y - median_pred) / median_pred
+    n = len(y)
+    tail = (1 - target_coverage) / 2
+    rel_hi = _finite_sample_quantile(relative_error, 1 - tail, n)
+    rel_lo = -_finite_sample_quantile(-relative_error, 1 - tail, n)
+    return rel_lo, rel_hi
 
 
-def evaluate(models, X, y, margin=0.0):
+def predict_range(model, X, rel_lo, rel_hi):
+    """Return non-crossing [low, median, high] price predictions."""
+    median_pred = predict_median(model, X)
+    lower = median_pred * (1 + rel_lo)
+    upper = median_pred * (1 + rel_hi)
+    predictions = np.column_stack([lower, median_pred, upper])
+    return np.sort(predictions, axis=1)
+
+
+def evaluate(model, X, y, rel_lo=0.0, rel_hi=0.0):
     """Calculate range calibration and point/quantile errors."""
-    predictions = apply_margin(predict_quantiles(models, X), margin)
+    predictions = predict_range(model, X, rel_lo, rel_hi)
     lower, median, upper = predictions.T
     return {
         "pinball_q10": float(mean_pinball_loss(y, lower, alpha=0.1)),
@@ -175,20 +208,21 @@ def run_training(
     condition_tags_path=None,
     target_coverage=0.8,
 ):
-    """Train from on-disk inputs and save the models and held-out metrics."""
+    """Train from on-disk inputs and save the model and held-out metrics."""
     split_data = load_training_data(embeddings_path, listings_path, splits_path, condition_tags_path)
-    models = train_models(*split_data["train"], n_estimators=n_estimators)
+    model = train_median_model(*split_data["train"], n_estimators=n_estimators)
 
-    margin = compute_calibration_margin(models, *split_data["val"], target_coverage=target_coverage)
+    rel_lo, rel_hi = compute_calibration_bounds(model, *split_data["val"], target_coverage=target_coverage)
     metrics = {
-        name: evaluate(models, *split_data[name], margin=margin) for name in ("val", "test")
+        name: evaluate(model, *split_data[name], rel_lo=rel_lo, rel_hi=rel_hi) for name in ("val", "test")
     }
-    metrics["calibration_margin"] = margin
+    metrics["rel_lo"] = rel_lo
+    metrics["rel_hi"] = rel_hi
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(
-        {"quantiles": list(QUANTILES), "models": models, "calibration_margin": margin},
+        {"model": model, "rel_lo": rel_lo, "rel_hi": rel_hi},
         out_dir / "price_models.joblib",
     )
     (out_dir / "price_metrics.json").write_text(

@@ -21,11 +21,9 @@ from sklearn.model_selection import KFold
 
 from modeling.train_price import (
     CONDITION_COLUMNS,
-    apply_margin,
-    compute_calibration_margin,
+    compute_calibration_bounds,
     evaluate,
-    predict_quantiles,
-    train_models,
+    train_median_model,
 )
 
 
@@ -62,14 +60,15 @@ def run_cv(embeddings_path, listings_path, condition_tags_path, n_folds=5, n_est
         n_cal = max(1, int(0.1 * len(shuffled)))
         cal_idx, train_idx = shuffled[:n_cal], shuffled[n_cal:]
 
-        models = train_models(X[train_idx], y[train_idx], n_estimators=n_estimators)
-        margin = compute_calibration_margin(models, X[cal_idx], y[cal_idx], target_coverage=target_coverage)
-        metrics = evaluate(models, X[test_idx], y[test_idx], margin=margin)
-        metrics["margin"] = margin
+        model = train_median_model(X[train_idx], y[train_idx], n_estimators=n_estimators)
+        rel_lo, rel_hi = compute_calibration_bounds(model, X[cal_idx], y[cal_idx], target_coverage=target_coverage)
+        metrics = evaluate(model, X[test_idx], y[test_idx], rel_lo=rel_lo, rel_hi=rel_hi)
+        metrics["rel_lo"] = rel_lo
+        metrics["rel_hi"] = rel_hi
         fold_metrics.append(metrics)
         print(f"  fold {fold_i}: R2={metrics['median_r2']:.3f} MAE={metrics['median_mae']:.0f} coverage={metrics['interval_coverage']:.3f}")
 
-    keys = [k for k in fold_metrics[0] if k != "margin"]
+    keys = [k for k in fold_metrics[0] if k not in ("rel_lo", "rel_hi")]
     summary = {
         k: {"mean": float(np.mean([m[k] for m in fold_metrics])), "std": float(np.std([m[k] for m in fold_metrics]))}
         for k in keys

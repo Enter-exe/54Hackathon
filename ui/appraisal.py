@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from modeling.confidence import adjust_price_range
-from modeling.train_price import apply_margin, predict_quantiles
+from modeling.train_price import predict_range
 from pipeline.condition_assessment import ATTRIBUTES, assess_images, load_text_embeddings
 from pipeline.extract_embeddings import embed_images, load_model
 from pipeline.gate_images import gate_images
@@ -151,9 +151,8 @@ def run_appraisal(paths: list[str], resources: dict) -> dict:
     X = np.concatenate([pooled, condition_features]).reshape(1, -1).astype(np.float32)
 
     bundle = resources["bundle"]
-    raw_quantiles = predict_quantiles(bundle["models"], X)
-    calibrated_quantiles = apply_margin(raw_quantiles, bundle["calibration_margin"])[0]
-    price_result = adjust_price_range(calibrated_quantiles, gate_result)
+    price_range = predict_range(bundle["model"], X, bundle["rel_lo"], bundle["rel_hi"])[0]
+    price_result = adjust_price_range(price_range, gate_result)
 
     comparables_result = (
         find_comparables(pooled, resources["comparables_index"]) if resources["comparables_index"] is not None else None
