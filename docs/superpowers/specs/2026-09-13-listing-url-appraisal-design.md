@@ -122,7 +122,11 @@ guard against server-side request forgery and resource exhaustion:
 - Limit HTML to 5 MB, each image to 15 MB, candidate downloads to 24, and
   retained images to eight.
 - Require an image content type and successful Pillow verification.
-- Never execute scripts found in fetched HTML or follow page instructions.
+- Static parsing never evaluates scripts found in fetched HTML. The optional
+  browser may execute page JavaScript only inside a fresh context with no
+  authentication state and with downloads disabled.
+- Never interpret page content as instructions or allow it to alter the
+  extraction and appraisal workflow.
 - Do not send authentication cookies or attempt to defeat access controls.
 
 DNS validation reduces the practical SSRF surface for this prototype but is
