@@ -712,6 +712,60 @@ def test_extract_listing_images_returns_only_image_contract(tmp_path, monkeypatc
     assert set(result) == {"source_url", "source_host", "image_paths", "warnings"}
 
 
+def test_extract_listing_images_uses_only_purple_wave_api_image_fields(tmp_path):
+    listing_url = (
+        "https://www.purplewave.com/auction/260917/item/FK3297/"
+        "2017-Peterbilt-389-Trucks-Truck_Tractor-Kansas"
+    )
+    api_url = (
+        "https://www.purplewave.com/v1/search/auction/260917/item/FK3297"
+        "?return_fields=image_url,image_files"
+    )
+    image_base = "https://d323w7klwy72q3.cloudfront.net/i/a/2026/20260917truck"
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        if url == listing_url:
+            return FakeResponse(chunks=[b"<html></html>"])
+        if url == api_url:
+            return FakeResponse(
+                headers={"Content-Type": "application/json"},
+                chunks=[
+                    (
+                        '{"image_url":"' + image_base + '",'
+                        '"image_files":["FK3297.JPG","FK3297A.JPG"],'
+                        '"current_bid":"72000",'
+                        '"price_image":"https://tracker.example/72000.jpg"}'
+                    ).encode()
+                ],
+            )
+        colors = {
+            f"{image_base}/FK3297.JPG": "red",
+            f"{image_base}/FK3297A.JPG": "blue",
+        }
+        return FakeResponse(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=[image_bytes(colors[url])],
+        )
+
+    result = extract_listing_images(
+        listing_url,
+        tmp_path,
+        http_get=get,
+        resolver=public_resolver,
+    )
+
+    assert len(result["image_paths"]) == 2
+    assert requested == [
+        listing_url,
+        api_url,
+        f"{image_base}/FK3297.JPG",
+        f"{image_base}/FK3297A.JPG",
+    ]
+    assert all("72000" not in url for url in requested)
+
+
 def test_browser_failure_becomes_manual_upload_error(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "pipeline.listing_images.fetch_html",

@@ -227,6 +227,90 @@ def fetch_html(url, *, http_get=None, resolver=socket.getaddrinfo):
     raise AssertionError("redirect loop must return or raise")
 
 
+def _purple_wave_image_urls(url, *, http_get=None, resolver=socket.getaddrinfo):
+    parts = urlsplit(url)
+    path = [part for part in parts.path.split("/") if part]
+    if (
+        not _host_is((parts.hostname or "").lower(), "purplewave.com")
+        or len(path) < 4
+        or path[0] != "auction"
+        or path[2] != "item"
+    ):
+        return []
+    auction, item = path[1], path[3]
+    if not all(
+        value.isascii()
+        and value
+        and all(character.isalnum() or character in "-_" for character in value)
+        for value in (auction, item)
+    ):
+        return []
+
+    api_url = urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        f"/v1/search/auction/{auction}/item/{item}",
+        "return_fields=image_url,image_files",
+        "",
+    ))
+    get = http_get or requests.get
+    current = validate_public_url(api_url, resolver)
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        try:
+            response = get(
+                current,
+                headers={"User-Agent": USER_AGENT},
+                timeout=TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            raise ListingExtractionError(
+                "unavailable", "Purple Wave photo data could not be fetched."
+            ) from exc
+        try:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                if redirect_count == MAX_REDIRECTS or not response.headers.get("Location"):
+                    raise ListingExtractionError(
+                        "redirect", "Purple Wave photo data redirected too many times."
+                    )
+                current = _redirect_target(current, response.headers["Location"], resolver)
+                continue
+            if response.status_code in {401, 403, 429}:
+                raise ListingExtractionError(
+                    "blocked", "Purple Wave blocked automatic photo extraction."
+                )
+            if response.status_code != 200:
+                return []
+            if "json" not in response.headers.get("Content-Type", "").lower():
+                return []
+            try:
+                data = json.loads(_read_bounded(response, MAX_HTML_BYTES))
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                return []
+            base = data.get("image_url") if isinstance(data, dict) else None
+            files = data.get("image_files") if isinstance(data, dict) else None
+            base_url = _canonical_image_url(base, url)
+            if (
+                base_url is None
+                or not _host_is((urlsplit(base_url).hostname or "").lower(), "cloudfront.net")
+                or not urlsplit(base_url).path.startswith("/i/a/")
+                or not isinstance(files, list)
+            ):
+                return []
+            return _dedupe([
+                urljoin(base_url.rstrip("/") + "/", filename)
+                for filename in files
+                if isinstance(filename, str)
+                and filename.isascii()
+                and filename
+                and all(character.isalnum() or character in ".-_" for character in filename)
+            ])
+        finally:
+            response.close()
+    raise AssertionError("redirect loop must return or raise")
+
+
 def render_html_with_playwright(
     url,
     *,
@@ -368,6 +452,11 @@ def extract_listing_images(
     safe_url = validate_public_url(url, resolver)
     final_url, html = fetch_html(safe_url, http_get=http_get, resolver=resolver)
     candidates = extract_image_urls(html, final_url)
+
+    if not candidates:
+        candidates = _purple_wave_image_urls(
+            final_url, http_get=http_get, resolver=resolver
+        )
 
     if not candidates and browser_renderer is not None:
         final_url, html = browser_renderer(final_url)
