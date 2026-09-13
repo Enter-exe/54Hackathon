@@ -38,8 +38,15 @@ streamlit run ui/app.py
 ```
 
 For a fresh setup without generated model artifacts, install the separate
-pipeline and training dependencies (including `pyarrow`), then build the
-artifacts before starting Streamlit:
+pipeline and training dependencies (including `pyarrow`). The pipeline requires
+`data/raw/listings.parquet` with listing IDs (`ad_id`), prices, and vehicle fields,
+plus matching photos at `data/images/<ad_id>/*.webp`. The
+[`scraper/scrape_ctt.py`](scraper/scrape_ctt.py) acquisition script produces both;
+[`scraper/jsonl_to_parquet.py`](scraper/jsonl_to_parquet.py) can convert an existing
+`data/raw/scraped_raw.jsonl` listing dump but does not download its images.
+The completed-sale CSV under `data/commercial_truck_sales_100/` uses a different
+layout and must be converted before these pipeline commands can consume it.
+Once those inputs are present, build the artifacts before starting Streamlit:
 
 ```bash
 python -m pip install -r pipeline/requirements.txt -r modeling/requirements.txt
@@ -49,7 +56,7 @@ python -m pipeline.condition_assessment
 python -m modeling.train_price
 ```
 
-Browser rendering for JavaScript-only listing pages is optional. Enable it by
+Browser rendering for inline JavaScript listing galleries is optional. Enable it by
 installing the scraper dependencies and Chromium:
 
 ```bash
@@ -61,6 +68,7 @@ The app accepts either uploaded truck photos or a public listing URL. URL
 appraisal extracts photos only; asking prices and current bids are not model
 inputs. Purple Wave and Commercial Truck Trader receive dedicated parsing,
 with generic structured-image extraction for other public listing pages.
-Without the optional browser renderer, JavaScript-only pages—and pages blocked
-by authentication, CAPTCHA, or bot protection—fall back to manual photo
-upload.
+The browser evaluates bounded HTML offline and blocks all external scripts,
+images, media, and WebSocket requests. Pages requiring external JavaScript or
+network calls may need manual photo upload. Blocked, unsafe, oversized, or
+excessively redirected pages also return to manual upload without a browser retry.

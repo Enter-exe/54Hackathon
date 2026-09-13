@@ -1,9 +1,13 @@
 from contextlib import nullcontext
+from functools import partial
 from pathlib import Path
+import socket
+from types import SimpleNamespace
 
 import pytest
+import requests
 
-from pipeline.listing_images import ListingExtractionError
+from pipeline.listing_images import ListingExtractionError, extract_listing_images
 from ui import app
 from ui.app import appraise_listing_url, listing_error_message
 
@@ -331,3 +335,40 @@ def test_main_rejected_result_uses_existing_rejection_renderer(monkeypatch):
     app.main()
 
     assert observed == [rejected]
+
+
+@pytest.mark.parametrize("case, message", [
+    ("idna", "Enter a public HTTP or HTTPS listing URL."),
+    ("stream", "We couldn't reach that listing. Check the URL and try again."),
+    ("markup", "We couldn't find usable truck photos on that listing."),
+])
+def test_main_extraction_failures_stay_inside_manual_upload_boundary(case, message, monkeypatch):
+    fake = FakeStreamlit(
+        submitted=True,
+        listing_url="https://a..com/truck" if case == "idna" else "https://example.com/truck",
+    )
+
+    def chunks(chunk_size):
+        yield b'<meta property><img srcset><script type></script><img src="http://[oops">'
+        if case == "stream":
+            raise requests.ConnectionError("interrupted stream")
+
+    response = SimpleNamespace(
+        status_code=200, headers={"Content-Type": "text/html"}, encoding="utf-8",
+        iter_content=chunks, close=lambda: None,
+    )
+    extractor = partial(
+        extract_listing_images, http_get=lambda *args, **kwargs: response,
+        resolver=lambda host, port, type: [(socket.AF_INET, type, 6, "", ("93.184.216.34", port))],
+    )
+    monkeypatch.setattr(app, "st", fake)
+    monkeypatch.setattr(app, "cached_load_resources", object)
+    monkeypatch.setattr(app, "appraise_listing_url", partial(
+        appraise_listing_url, extractor=extractor, browser_renderer=None,
+        appraiser=lambda *args: pytest.fail("invalid extraction reached appraisal"),
+    ))
+
+    app.main()
+
+    assert ("error", (message,), {}) in fake.calls
+    assert ("info", ("Switch to Upload photos to continue manually.",), {}) in fake.calls

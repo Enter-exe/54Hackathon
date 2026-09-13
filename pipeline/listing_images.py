@@ -19,7 +19,7 @@ class _ImageParser(HTMLParser):
         self._json_parts = None
 
     def handle_starttag(self, tag, attrs):
-        values = dict(attrs)
+        values = {name: value or "" for name, value in attrs}
         if tag == "meta" and values.get("property", values.get("name", "")).lower() in {
             "og:image", "og:image:url", "twitter:image"
         }:
@@ -60,10 +60,11 @@ def _dedupe(values):
 def _canonical_image_url(value, page_url):
     if not isinstance(value, str) or not value:
         return None
-    if urlsplit(value).scheme.lower() == "data":
+    try:
+        resolved = urljoin(page_url, value)
+        parts = urlsplit(resolved)
+    except ValueError:
         return None
-    resolved = urljoin(page_url, value)
-    parts = urlsplit(resolved)
     if parts.scheme.lower() == "data":
         return None
     return urlunsplit((parts.scheme.lower(), parts.netloc, parts.path, parts.query, ""))
@@ -110,6 +111,19 @@ class ListingExtractionError(ValueError):
         self.code = code
 
 
+def _is_public_address(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.is_global and not any(
+        getattr(address, category, False)
+        for category in (
+            "is_loopback", "is_private", "is_link_local", "is_multicast",
+            "is_reserved", "is_unspecified", "is_site_local",
+        )
+    )
+
+
 def validate_public_url(url, resolver=socket.getaddrinfo):
     try:
         parts = urlsplit(str(url).strip())
@@ -125,12 +139,15 @@ def validate_public_url(url, resolver=socket.getaddrinfo):
     if port not in {None, expected_port}:
         raise ListingExtractionError("unsafe_url", "The listing URL must use a standard HTTP or HTTPS port.")
 
-    host = parts.hostname.encode("idna").decode("ascii")
+    try:
+        host = parts.hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ListingExtractionError("unsafe_url", "The listing hostname is malformed.") from exc
     try:
         addresses = resolver(host, port or expected_port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise ListingExtractionError("unavailable", "The listing hostname could not be resolved.") from exc
-    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+    if not addresses or any(not _is_public_address(item[4][0]) for item in addresses):
         raise ListingExtractionError("unsafe_url", "The listing hostname must resolve only to public addresses.")
 
     display_host = f"[{host}]" if ":" in host else host
@@ -158,11 +175,22 @@ def _read_bounded(response, maximum):
         if declared_size > maximum:
             raise ListingExtractionError("too_large", "The remote response is too large.")
     body = bytearray()
-    for chunk in response.iter_content(64 * 1024):
-        if len(body) + len(chunk) > maximum:
-            raise ListingExtractionError("too_large", "The remote response is too large.")
-        body.extend(chunk)
+    try:
+        for chunk in response.iter_content(64 * 1024):
+            if len(body) + len(chunk) > maximum:
+                raise ListingExtractionError("too_large", "The remote response is too large.")
+            body.extend(chunk)
+    except requests.RequestException as exc:
+        raise ListingExtractionError("unavailable", "The remote response could not be read.") from exc
     return bytes(body)
+
+
+def _redirect_target(current, location, resolver):
+    try:
+        target = urljoin(current, location)
+    except ValueError as exc:
+        raise ListingExtractionError("unsafe_url", "The redirect URL is malformed.") from exc
+    return validate_public_url(target, resolver)
 
 
 def fetch_html(url, *, http_get=None, resolver=socket.getaddrinfo):
@@ -183,7 +211,7 @@ def fetch_html(url, *, http_get=None, resolver=socket.getaddrinfo):
             if response.status_code in {301, 302, 303, 307, 308}:
                 if redirect_count == MAX_REDIRECTS or not response.headers.get("Location"):
                     raise ListingExtractionError("redirect", "The listing redirected too many times.")
-                current = validate_public_url(urljoin(current, response.headers["Location"]), resolver)
+                current = _redirect_target(current, response.headers["Location"], resolver)
                 continue
             if response.status_code in {401, 403, 429}:
                 raise ListingExtractionError("blocked", "The listing site blocked automatic access.")
@@ -216,6 +244,9 @@ def render_html_with_playwright(
             ) from exc
         playwright_factory = sync_playwright
 
+    # Only the bounded HTTP transport may contact the listing or follow redirects.
+    # Chromium receives an isolated document; external-script pages may need upload.
+    final_url, html = fetch_html(safe_url, resolver=resolver)
     browser = None
     context = None
     page = None
@@ -226,41 +257,9 @@ def render_html_with_playwright(
                 user_agent=USER_AGENT,
                 accept_downloads=False,
                 service_workers="block",
+                offline=True,
             )
-            route_failure = None
-
-            def guard_route(route):
-                nonlocal route_failure
-                try:
-                    request_url = validate_public_url(route.request.url, resolver)
-                    response = route.fetch(
-                        max_redirects=0,
-                        timeout=BROWSER_TIMEOUT_MS,
-                    )
-                    if response.status in {301, 302, 303, 307, 308}:
-                        redirects = 0
-                        previous = route.request.redirected_from
-                        while previous is not None:
-                            redirects += 1
-                            previous = previous.redirected_from
-                        location = {
-                            key.lower(): value for key, value in response.headers.items()
-                        }.get("location")
-                        if redirects >= MAX_REDIRECTS or not location:
-                            raise ListingExtractionError(
-                                "redirect", "The listing redirected too many times."
-                            )
-                        validate_public_url(urljoin(request_url, location), resolver)
-                    route.fulfill(response=response)
-                except Exception as exc:
-                    if route_failure is None:
-                        route_failure = exc
-                    try:
-                        route.abort()
-                    except Exception:
-                        pass
-
-            context.route("**/*", guard_route)
+            context.route("**/*", lambda route: route.abort())
             route_web_socket = getattr(context, "route_web_socket", None)
             if route_web_socket is None:
                 raise ListingExtractionError(
@@ -269,29 +268,14 @@ def render_html_with_playwright(
                 )
             route_web_socket("**/*", lambda web_socket: web_socket.close())
             page = context.new_page()
-            try:
-                page.goto(
-                    safe_url,
-                    wait_until="domcontentloaded",
-                    timeout=BROWSER_TIMEOUT_MS,
-                )
-            except Exception as exc:
-                if route_failure is not None:
-                    raise route_failure from exc
-                raise
-            if route_failure is not None:
-                raise route_failure
+            page.set_content(
+                html, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS,
+            )
             try:
                 page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
             except Exception:
-                if route_failure is not None:
-                    raise route_failure
-            if route_failure is not None:
-                raise route_failure
-            final_url = validate_public_url(page.url, resolver)
+                pass
             html = page.content()
-            if route_failure is not None:
-                raise route_failure
             if len(html.encode("utf-8")) > MAX_HTML_BYTES:
                 raise ListingExtractionError(
                     "too_large", "The rendered listing page is too large."
@@ -340,9 +324,7 @@ def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddri
                             raise ListingExtractionError(
                                 "redirect", "An image redirected too many times."
                             )
-                        current = validate_public_url(
-                            urljoin(current, response.headers["Location"]), resolver
-                        )
+                        current = _redirect_target(current, response.headers["Location"], resolver)
                         continue
                     if response.status_code != 200 or not response.headers.get(
                         "Content-Type", ""
@@ -384,21 +366,10 @@ def extract_listing_images(
     resolver=socket.getaddrinfo,
 ):
     safe_url = validate_public_url(url, resolver)
-    warnings = []
-    used_browser = False
-    try:
-        final_url, html = fetch_html(safe_url, http_get=http_get, resolver=resolver)
-        candidates = extract_image_urls(html, final_url)
-    except ListingExtractionError as exc:
-        if browser_renderer is None:
-            raise
-        warnings.append(f"Static extraction failed: {exc}")
-        final_url, html = browser_renderer(safe_url)
-        used_browser = True
-        final_url = validate_public_url(final_url, resolver)
-        candidates = extract_image_urls(html, final_url)
+    final_url, html = fetch_html(safe_url, http_get=http_get, resolver=resolver)
+    candidates = extract_image_urls(html, final_url)
 
-    if not candidates and browser_renderer is not None and not used_browser:
+    if not candidates and browser_renderer is not None:
         final_url, html = browser_renderer(final_url)
         final_url = validate_public_url(final_url, resolver)
         candidates = extract_image_urls(html, final_url)
@@ -419,5 +390,5 @@ def extract_listing_images(
         "source_url": final_url,
         "source_host": urlsplit(final_url).hostname,
         "image_paths": paths,
-        "warnings": [*warnings, *download_warnings],
+        "warnings": download_warnings,
     }

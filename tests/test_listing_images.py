@@ -124,15 +124,18 @@ class FakeBrowserResponse:
 
 
 class FakeRoute:
-    def __init__(self, url, status=200, headers=None, redirected_from=None):
+    def __init__(self, url, status=200, headers=None, redirected_from=None, automatic_redirects=()):
         self.request = SimpleNamespace(url=url, redirected_from=redirected_from)
         self.response = FakeBrowserResponse(status, headers)
         self.aborted = False
         self.fulfilled = False
         self.fetch_max_redirects = None
         self.fetch_timeout = None
+        self.automatic_redirects = automatic_redirects
+        self.contacted = []
 
     def fetch(self, *, max_redirects, timeout):
+        self.contacted.append(self.request.url)
         self.fetch_max_redirects = max_redirects
         self.fetch_timeout = timeout
         return self.response
@@ -143,6 +146,8 @@ class FakeRoute:
     def fulfill(self, *, response):
         assert response is self.response
         self.fulfilled = True
+        # Chromium follows a fulfilled redirect without invoking the route again.
+        self.contacted.extend(self.automatic_redirects)
 
 
 class FakeWebSocket:
@@ -165,6 +170,17 @@ class FakePage:
         self.context = None
         self.closed = False
         self.goto_error = None
+        self.rendered_html = '<meta property="og:image" content="/truck.jpg">'
+        self.received_html = None
+
+    def set_content(self, html, wait_until, timeout):
+        self.received_html = html
+        for route in [*self.routes, *self.popup_routes]:
+            self.context.route_handler(route)
+        for web_socket in self.web_sockets:
+            self.context.web_socket_handler(web_socket)
+        if self.goto_error:
+            raise self.goto_error
 
     def goto(self, url, wait_until, timeout):
         self.requested_url = url
@@ -184,7 +200,7 @@ class FakePage:
     def content(self):
         if self.content_route is not None:
             self.context.route_handler(self.content_route)
-        return '<meta property="og:image" content="/truck.jpg">'
+        return self.rendered_html
 
     def close(self):
         self.closed = True
@@ -222,13 +238,14 @@ class FakeBrowser:
         self.context_options = None
         self.closed = False
 
-    def new_context(self, user_agent, accept_downloads, service_workers):
+    def new_context(self, user_agent, accept_downloads, service_workers, offline=False):
         if self.fail_context:
             raise RuntimeError("context creation failed")
         self.context_options = {
             "user_agent": user_agent,
             "accept_downloads": accept_downloads,
             "service_workers": service_workers,
+            "offline": offline,
         }
         return self.context
 
@@ -259,9 +276,77 @@ def public_resolver_with_localhost(host, port, type=socket.SOCK_STREAM):
     return [(socket.AF_INET, type, 6, "", (address, port))]
 
 
-def test_playwright_renderer_returns_final_url_and_html():
+@pytest.fixture
+def browser_http(monkeypatch):
+    def get(url, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        assert kwargs["stream"] is True
+        return FakeResponse(chunks=[b"<html><body>Inline content</body></html>"])
+
+    monkeypatch.setattr("pipeline.listing_images.requests.get", get)
+    return get
+
+
+def test_playwright_renderer_never_hands_browser_a_redirect(browser_http):
+    route = FakeRoute(
+        "https://a.example/script.js", status=302,
+        headers={"location": "https://b.example/script.js"},
+        automatic_redirects=["https://b.example/script.js", "http://127.0.0.1/private"],
+    )
+    page = FakePage(routes=[route])
+    render_html_with_playwright(
+        "https://example.com/start", resolver=public_resolver_with_localhost,
+        playwright_factory=fake_playwright_factory(page),
+    )
+    assert route.contacted == []
+    assert route.aborted
+    assert not route.fulfilled
+
+
+def test_playwright_renderer_bounds_main_html_before_browser(monkeypatch):
+    monkeypatch.setattr(
+        "pipeline.listing_images.requests.get",
+        lambda *args, **kwargs: FakeResponse(chunks=[b"x" * (5 * 1024 * 1024 + 1)]),
+    )
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start", resolver=public_resolver,
+            playwright_factory=lambda: pytest.fail("oversized HTML reached browser"),
+        )
+    assert error.value.code == "too_large"
+
+
+def test_playwright_renderer_rejects_two_public_hops_then_private_before_contact(monkeypatch):
+    responses = iter([
+        FakeResponse(302, {"Location": "https://b.example/truck"}),
+        FakeResponse(302, {"Location": "http://127.0.0.1/private"}),
+    ])
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        assert kwargs["allow_redirects"] is False
+        return next(responses)
+
+    monkeypatch.setattr("pipeline.listing_images.requests.get", get)
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://a.example/truck", resolver=public_resolver_with_localhost,
+            playwright_factory=lambda: pytest.fail("unsafe redirect reached browser"),
+        )
+    assert error.value.code == "unsafe_url"
+    assert requested == ["https://a.example/truck", "https://b.example/truck"]
+
+
+def test_playwright_renderer_returns_fetched_url_and_offline_html(browser_http, monkeypatch):
     page = FakePage()
+    page.url = "about:blank"
     manager = FakePlaywrightManager(page)
+    responses = iter([
+        FakeResponse(302, {"Location": "/final"}),
+        FakeResponse(chunks=[b"<html>Inline content</html>"]),
+    ])
+    monkeypatch.setattr("pipeline.listing_images.requests.get", lambda *a, **k: next(responses))
     final_url, html = render_html_with_playwright(
         "https://example.com/start",
         resolver=public_resolver,
@@ -269,139 +354,82 @@ def test_playwright_renderer_returns_final_url_and_html():
     )
     assert final_url == "https://example.com/final"
     assert "truck.jpg" in html
+    assert "Inline content" in page.received_html
     assert manager.browser.context_options["accept_downloads"] is False
     assert manager.browser.context_options["service_workers"] == "block"
+    assert manager.browser.context_options["offline"] is True
     assert page.closed is True
     assert manager.browser.context.closed is True
     assert manager.browser.closed is True
 
 
-def test_playwright_renderer_rejects_unsafe_final_navigation():
-    page = FakePage()
-    page.url = "http://127.0.0.1/private"
-    with pytest.raises(ListingExtractionError, match="public"):
-        render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver_with_localhost,
-            playwright_factory=fake_playwright_factory(page),
-        )
-
-
-def test_playwright_renderer_rejects_public_to_private_redirect_before_contact():
-    route = FakeRoute(
-        "https://example.com/start",
-        status=302,
-        headers={"location": "http://127.0.0.1/private"},
-    )
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd", "http://127.0.0.1/private", "https://example.com/script.js",
+    "https://images.example.com/truck.jpg", "https://example.com/large-video.mp4",
+])
+def test_playwright_renderer_aborts_all_resources_before_fetch(url, browser_http):
+    route = FakeRoute(url)
     page = FakePage(routes=[route])
-
-    with pytest.raises(ListingExtractionError) as error:
-        render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver_with_localhost,
-            playwright_factory=fake_playwright_factory(page),
-        )
-
-    assert error.value.code == "unsafe_url"
-    assert route.fetch_max_redirects == 0
-    assert route.fulfilled is False
-
-
-def test_playwright_renderer_rejects_non_http_request_before_fetch():
-    route = FakeRoute("file:///etc/passwd")
-    page = FakePage(routes=[route])
-
-    with pytest.raises(ListingExtractionError) as error:
-        render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
-            playwright_factory=fake_playwright_factory(page),
-        )
-
-    assert error.value.code == "unsafe_url"
-    assert route.fetch_max_redirects is None
-
-
-def test_playwright_renderer_preserves_late_unsafe_route_failure():
-    route = FakeRoute("http://127.0.0.1/private")
-    page = FakePage(content_route=route)
-
-    with pytest.raises(ListingExtractionError) as error:
-        render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver_with_localhost,
-            playwright_factory=fake_playwright_factory(page),
-        )
-
-    assert error.value.code == "unsafe_url"
-    assert route.fetch_max_redirects is None
-
-
-def test_playwright_renderer_fetches_public_request_without_redirects():
-    route = FakeRoute("https://images.example.com/truck.jpg")
-    page = FakePage(routes=[route])
-
     render_html_with_playwright(
         "https://example.com/start",
-        resolver=public_resolver,
+        resolver=public_resolver_with_localhost,
         playwright_factory=fake_playwright_factory(page),
     )
+    assert route.aborted
+    assert route.contacted == []
+    assert not route.fulfilled
 
-    assert route.fetch_max_redirects == 0
-    assert route.fetch_timeout == 10_000
-    assert route.fulfilled is True
 
-
-def test_playwright_renderer_routes_popup_first_request_through_context():
-    popup_route = FakeRoute("https://popup.example.com/start")
-    page = FakePage(popup_routes=[popup_route])
-
+def test_playwright_renderer_blocks_late_and_popup_requests(browser_http):
+    late = FakeRoute("http://127.0.0.1/private")
+    popup = FakeRoute("https://popup.example.com/start")
+    page = FakePage(content_route=late, popup_routes=[popup])
     render_html_with_playwright(
-        "https://example.com/start",
-        resolver=public_resolver,
+        "https://example.com/start", resolver=public_resolver_with_localhost,
         playwright_factory=fake_playwright_factory(page),
     )
+    assert late.aborted and popup.aborted
+    assert late.contacted == popup.contacted == []
 
-    assert popup_route.fulfilled is True
 
-
-def test_playwright_renderer_blocks_web_sockets():
+def test_playwright_renderer_blocks_web_sockets(browser_http):
     web_socket = FakeWebSocket()
     page = FakePage(web_sockets=[web_socket])
-
     render_html_with_playwright(
-        "https://example.com/start",
-        resolver=public_resolver,
+        "https://example.com/start", resolver=public_resolver,
         playwright_factory=fake_playwright_factory(page),
     )
-
     assert web_socket.closed is True
 
 
-def test_playwright_renderer_bounds_redirect_chains():
-    redirected_from = None
-    for index in range(3):
-        redirected_from = SimpleNamespace(
-            url=f"https://example.com/redirect-{index}",
-            redirected_from=redirected_from,
-        )
-    route = FakeRoute(
-        "https://example.com/final-redirect",
-        status=302,
-        headers={"location": "/one-too-many"},
-        redirected_from=redirected_from,
-    )
-    page = FakePage(routes=[route])
+def test_playwright_renderer_bounds_redirect_chains(monkeypatch):
+    requested = []
 
+    def get(url, **kwargs):
+        requested.append(url)
+        assert kwargs["allow_redirects"] is False
+        return FakeResponse(302, {"Location": f"/redirect-{len(requested)}"})
+
+    monkeypatch.setattr("pipeline.listing_images.requests.get", get)
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
+            "https://example.com/start", resolver=public_resolver,
+            playwright_factory=lambda: pytest.fail("redirect limit reached browser"),
+        )
+    assert error.value.code == "redirect"
+    assert len(requested) == 4
+
+
+def test_playwright_renderer_bounds_rendered_html(browser_http):
+    page = FakePage()
+    page.rendered_html = "x" * (5 * 1024 * 1024 + 1)
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start", resolver=public_resolver,
             playwright_factory=fake_playwright_factory(page),
         )
-
-    assert error.value.code == "redirect"
-    assert route.fulfilled is False
+    assert error.value.code == "too_large"
+    assert page.closed
 
 
 def test_playwright_renderer_reports_missing_optional_dependency(monkeypatch):
@@ -413,60 +441,47 @@ def test_playwright_renderer_reports_missing_optional_dependency(monkeypatch):
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", import_without_playwright)
-
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
+            "https://example.com/start", resolver=public_resolver,
         )
-
     assert error.value.code == "browser_unavailable"
 
 
-def test_playwright_renderer_closes_all_resources_after_navigation_failure():
+def test_playwright_renderer_closes_all_resources_after_render_failure(browser_http):
     page = FakePage()
-    page.goto_error = RuntimeError("navigation failed")
+    page.goto_error = RuntimeError("render failed")
     manager = FakePlaywrightManager(page)
-
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
+            "https://example.com/start", resolver=public_resolver,
             playwright_factory=lambda: manager,
         )
-
     assert error.value.code == "browser_failed"
     assert page.closed is True
     assert manager.browser.context.closed is True
     assert manager.browser.closed is True
 
 
-def test_playwright_renderer_closes_context_and_browser_after_page_creation_failure():
-    page = FakePage()
-    manager = FakePlaywrightManager(page, fail_new_page=True)
-
+def test_playwright_renderer_closes_context_and_browser_after_page_creation_failure(browser_http):
+    manager = FakePlaywrightManager(FakePage(), fail_new_page=True)
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
+            "https://example.com/start", resolver=public_resolver,
             playwright_factory=lambda: manager,
         )
-
     assert error.value.code == "browser_failed"
     assert manager.browser.context.closed is True
     assert manager.browser.closed is True
 
 
-def test_playwright_renderer_closes_browser_after_context_creation_failure():
+def test_playwright_renderer_closes_browser_after_context_creation_failure(browser_http):
     manager = FakePlaywrightManager(FakePage(), fail_context=True)
-
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(
-            "https://example.com/start",
-            resolver=public_resolver,
+            "https://example.com/start", resolver=public_resolver,
             playwright_factory=lambda: manager,
         )
-
     assert error.value.code == "browser_failed"
     assert manager.browser.closed is True
 
@@ -852,3 +867,158 @@ def test_fetch_html_returns_final_url_and_decoded_html():
         http_get=lambda *args, **kwargs: response,
         resolver=public_resolver,
     ) == ("https://example.com/truck", "<html>truck</html>")
+
+
+@pytest.mark.parametrize("address", [
+    "224.0.0.1", "239.255.255.250", "ff02::1", "ff0e::1", "fec0::1",
+    "::ffff:224.0.0.1", "0.0.0.0", "240.0.0.1", "::", "100::1",
+    "fe80::1", "::ffff:127.0.0.1",
+])
+def test_validate_public_url_rejects_prohibited_address_categories(address):
+    def resolver(host, port, type=socket.SOCK_STREAM):
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        return [(family, type, 6, "", (address, port))]
+
+    with pytest.raises(ListingExtractionError) as error:
+        validate_public_url("https://example.com/truck", resolver=resolver)
+    assert error.value.code == "unsafe_url"
+
+
+def test_validate_public_url_normalizes_malformed_idna_error():
+    with pytest.raises(ListingExtractionError) as error:
+        validate_public_url("https://a..com/truck", resolver=public_resolver)
+    assert error.value.code == "unsafe_url"
+
+
+@pytest.mark.parametrize("markup", ["<meta property>", "<img srcset>", "<script type></script>"])
+def test_malformed_attributes_do_not_hide_valid_images(markup):
+    assert extract_image_urls(
+        markup + '<img src="/truck.jpg">', "https://example.com/truck"
+    ) == ["https://example.com/truck.jpg"]
+
+
+def test_malformed_candidate_url_is_skipped():
+    assert extract_image_urls(
+        '<img src="http://[oops"><img src="/truck.jpg">',
+        "https://www.purplewave.com/truck",
+    ) == ["https://www.purplewave.com/truck.jpg"]
+
+
+@pytest.mark.parametrize("failure", [
+    requests.ConnectionError, requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError, requests.Timeout,
+])
+def test_fetch_html_normalizes_stream_errors_and_closes_response(failure):
+    class InterruptedResponse(FakeResponse):
+        closed = False
+
+        def iter_content(self, chunk_size):
+            yield b"<html>"
+            raise failure("interrupted response")
+
+        def close(self):
+            self.closed = True
+
+    response = InterruptedResponse()
+    with pytest.raises(ListingExtractionError) as error:
+        fetch_html(
+            "https://example.com/truck",
+            http_get=lambda *args, **kwargs: response,
+            resolver=public_resolver,
+        )
+    assert error.value.code == "unavailable"
+    assert response.closed
+
+
+@pytest.mark.parametrize("code", ["blocked", "unsafe_url", "too_large", "redirect", "unavailable", "unsupported"])
+def test_static_fetch_failures_never_trigger_browser(code, tmp_path, monkeypatch):
+    def fail_fetch(*args, **kwargs):
+        raise ListingExtractionError(code, "Static fetch failed.")
+
+    monkeypatch.setattr("pipeline.listing_images.fetch_html", fail_fetch)
+    with pytest.raises(ListingExtractionError) as error:
+        extract_listing_images(
+            "https://example.com/truck", tmp_path, resolver=public_resolver,
+            browser_renderer=lambda url: pytest.fail("browser must not run"),
+        )
+    assert error.value.code == code
+
+
+@pytest.mark.parametrize("valid_from, expected_attempts, expected_retained", [(0, 8, 8), (23, 24, 1)])
+def test_browser_candidates_use_bounded_downloader(
+    valid_from, expected_attempts, expected_retained, tmp_path, monkeypatch
+):
+    page = FakePage()
+    page.rendered_html = "".join(f'<img src="/image-{i}.jpg">' for i in range(30))
+    requested_images = []
+
+    def get(url, **kwargs):
+        assert kwargs["stream"] is True
+        assert kwargs["allow_redirects"] is False
+        if url.endswith("/listing"):
+            return FakeResponse(chunks=[b"<script>/* inline gallery */</script>"])
+        requested_images.append(url)
+        index = len(requested_images) - 1
+        body = image_bytes((index * 8, 0, 0)) if index >= valid_from else b"invalid"
+        return FakeResponse(headers={"Content-Type": "image/jpeg"}, chunks=[body])
+
+    monkeypatch.setattr("pipeline.listing_images.requests.get", get)
+    result = extract_listing_images(
+        "https://example.com/listing", tmp_path, resolver=public_resolver,
+        browser_renderer=lambda url: render_html_with_playwright(
+            url, resolver=public_resolver, playwright_factory=fake_playwright_factory(page),
+        ),
+    )
+    assert len(requested_images) == expected_attempts
+    assert len(result["image_paths"]) == expected_retained
+    assert all(Path(path).is_file() for path in result["image_paths"])
+    assert set(result) == {"source_url", "source_host", "image_paths", "warnings"}
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_browser_candidate_image_stops_at_fifteen_mib(declared, tmp_path, monkeypatch):
+    page = FakePage()
+    chunks_read = []
+
+    def chunks():
+        for index in range(300):
+            chunks_read.append(index)
+            yield b"x" * (64 * 1024)
+
+    def get(url, **kwargs):
+        if url.endswith("/listing"):
+            return FakeResponse(chunks=[b"<html></html>"])
+        headers = {"Content-Type": "image/jpeg"}
+        if declared:
+            headers["Content-Length"] = str(15 * 1024 * 1024 + 1)
+        return FakeResponse(headers=headers, chunks=chunks())
+
+    monkeypatch.setattr("pipeline.listing_images.requests.get", get)
+    with pytest.raises(ListingExtractionError) as error:
+        extract_listing_images(
+            "https://example.com/listing", tmp_path, resolver=public_resolver,
+            browser_renderer=lambda url: render_html_with_playwright(
+                url, resolver=public_resolver, playwright_factory=fake_playwright_factory(page),
+            ),
+        )
+    assert error.value.code == "no_images"
+    assert len(chunks_read) == (0 if declared else 241)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fetch_html_malformed_redirect_is_domain_error():
+    with pytest.raises(ListingExtractionError) as error:
+        fetch_html(
+            "https://example.com/listing", resolver=public_resolver,
+            http_get=lambda *args, **kwargs: FakeResponse(302, {"Location": "http://[oops"}),
+        )
+    assert error.value.code == "unsafe_url"
+
+
+def test_download_images_skips_malformed_redirect(tmp_path):
+    paths, warnings = download_images(
+        ["https://example.com/image.jpg"], tmp_path, resolver=public_resolver,
+        http_get=lambda *args, **kwargs: FakeResponse(302, {"Location": "http://[oops"}),
+    )
+    assert paths == []
+    assert warnings == ["Some listing images could not be used."]
