@@ -47,13 +47,18 @@ USER_AGENT = "Kamion image-only appraisal/1.0"
 
 def _read_bounded(response, maximum):
     declared = response.headers.get("Content-Length")
-    if declared and int(declared) > maximum:
-        raise ListingExtractionError("too_large", "The remote response is too large.")
+    if declared:
+        try:
+            declared_size = int(declared)
+        except (TypeError, ValueError) as exc:
+            raise ListingExtractionError("too_large", "The remote response size is invalid.") from exc
+        if declared_size > maximum:
+            raise ListingExtractionError("too_large", "The remote response is too large.")
     body = bytearray()
     for chunk in response.iter_content(64 * 1024):
-        body.extend(chunk)
-        if len(body) > maximum:
+        if len(body) + len(chunk) > maximum:
             raise ListingExtractionError("too_large", "The remote response is too large.")
+        body.extend(chunk)
     return bytes(body)
 
 

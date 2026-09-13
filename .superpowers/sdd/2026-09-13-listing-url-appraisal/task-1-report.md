@@ -22,3 +22,12 @@
 ## Concerns
 
 - The complete repository suite cannot currently run in this worktree because its ML/training dependencies are not installed. The focused Task 1 suite and syntax checks pass.
+
+## Review follow-up
+
+- Added a deterministic malformed `Content-Length` test and convert invalid declarations to `ListingExtractionError(code="too_large")`.
+- Changed streaming enforcement to check `len(body) + len(chunk)` before extending the body, so the in-memory buffer never exceeds the configured maximum.
+- `python -m pytest tests/test_listing_images.py -v` — **14 passed in 0.06s**.
+- `python -m py_compile pipeline/listing_images.py tests/test_listing_images.py` — passed.
+- `git diff --check` — passed.
+- `python -m pytest -q` — still blocked during collection by the same 9 missing-dependency errors (`torch`, `sklearn`, `open_clip`, and `joblib`).

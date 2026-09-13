@@ -84,6 +84,33 @@ def test_fetch_html_rejects_oversized_body(monkeypatch):
         )
 
 
+def test_fetch_html_rejects_malformed_content_length():
+    from pipeline.listing_images import fetch_html
+
+    response = FakeResponse(headers={"Content-Type": "text/html", "Content-Length": "unknown"})
+
+    with pytest.raises(ListingExtractionError, match="size"):
+        fetch_html(
+            "https://example.com/truck",
+            http_get=lambda *args, **kwargs: response,
+            resolver=public_resolver,
+        )
+
+
+def test_fetch_html_does_not_append_chunk_past_limit(monkeypatch):
+    from pipeline.listing_images import fetch_html
+
+    monkeypatch.setattr("pipeline.listing_images.MAX_HTML_BYTES", 8)
+    response = FakeResponse(chunks=[b"123456789"])
+
+    with pytest.raises(ListingExtractionError, match="large"):
+        fetch_html(
+            "https://example.com/truck",
+            http_get=lambda *args, **kwargs: response,
+            resolver=public_resolver,
+        )
+
+
 def test_fetch_html_returns_final_url_and_decoded_html():
     from pipeline.listing_images import fetch_html
 
