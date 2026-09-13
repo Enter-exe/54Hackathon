@@ -34,12 +34,28 @@ python3 -m venv .venv
 ./.venv/bin/pytest -q
 ```
 
-The build writes cleaned listings, deterministic grouped splits, listing
-embeddings, a training-only comparable index, condition tags and calibration
-under `data/processed/`, plus the price models and held-out metrics under
-`artifacts/price_model/`. The validator writes
-`artifacts/validation_report.json`. These generated artifacts are ignored by
-Git and should be rebuilt locally from the repository inputs.
+The build contract contains exactly these eight generated artifacts:
+
+- `data/processed/listings_clean.csv` — canonical listing rows with IDs, USD
+  prices, vehicle metadata, JSON-encoded image paths, and source URLs.
+- `data/processed/splits.json` — deterministic `train`, `val`, and `test`
+  listing-ID arrays.
+- `data/processed/listing_embeddings.npz` — aligned `ad_ids` and normalized
+  listing-level `embeddings` arrays.
+- `data/processed/comparables_index.npz` — training-only embeddings plus
+  listing IDs, prices, years, makes, and models for nearest-sale lookup.
+- `data/processed/condition_tags.csv` — listing/split IDs with per-condition
+  probabilities and calibrated Boolean flags.
+- `data/processed/condition_calibration.json` — calibration percentile and
+  per-condition threshold mapping.
+- `artifacts/price_model/price_models.joblib` — quantile identifiers and the
+  three trained LightGBM price models.
+- `artifacts/price_model/price_metrics.json` — validation/test pinball losses,
+  median MAE and R², and interval coverage.
+
+The validator additionally writes `artifacts/validation_report.json`. All of
+these generated artifacts are ignored by Git and should be rebuilt locally
+from the repository inputs.
 
 ## Reproduced build and validation
 

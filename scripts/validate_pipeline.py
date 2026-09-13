@@ -86,6 +86,16 @@ def validate_pipeline(
     report_path = repo_root / "artifacts/validation_report.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+
+    assert report["held_out_truck"]["accepted"], (
+        "held_out_truck must be accepted"
+    )
+    assert not report["dark"]["accepted"], "dark must be rejected"
+    assert not report["blurry"]["accepted"], "blurry must be rejected"
+    assert not report["motorcycle"]["accepted"], "motorcycle must be rejected"
+    assert report["single_photo"]["confidence"] == "low", (
+        "single_photo confidence must be low"
+    )
     return report
 
 
