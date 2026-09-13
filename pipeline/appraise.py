@@ -1,9 +1,13 @@
 """Load appraisal artifacts once and compose a UI-ready truck appraisal."""
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
+
+# PyTorch and LightGBM wheels can load conflicting OpenMP runtimes on macOS.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import joblib
 import torch

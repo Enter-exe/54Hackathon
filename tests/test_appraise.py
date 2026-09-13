@@ -1,4 +1,8 @@
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import Mock
 
 import numpy as np
@@ -12,6 +16,28 @@ CONDITION = {
     "tire_wear": {"probability": 0.8, "flag": True},
     "interior_wear": {"probability": 0.3, "flag": False},
 }
+
+
+def test_appraise_limits_openmp_threads_before_native_imports():
+    # Catches a macOS crash when PyTorch and LightGBM initialize separate OpenMP runtimes.
+    environment = os.environ.copy()
+    environment.pop("OMP_NUM_THREADS", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os; import pipeline.appraise; print(os.environ['OMP_NUM_THREADS'])",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 def _engine():

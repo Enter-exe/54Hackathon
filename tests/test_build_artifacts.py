@@ -123,5 +123,5 @@ def test_build_artifacts_rejects_missing_required_artifact(tmp_path, monkeypatch
     _write_sales_fixture(dataset_dir)
     _install_stage_fakes(monkeypatch, omit="price_metrics")
 
-    with pytest.raises(RuntimeError, match="artifact build incomplete: \['price_metrics'\]"):
+    with pytest.raises(RuntimeError, match=r"artifact build incomplete: \['price_metrics'\]"):
         build_artifacts(repo_root, n_estimators=5)
