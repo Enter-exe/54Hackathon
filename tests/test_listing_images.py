@@ -176,6 +176,52 @@ def test_download_images_validates_content_and_deduplicates_bytes(tmp_path):
     assert warnings == ["Some listing images could not be used."]
 
 
+def test_download_images_rejects_truncated_image_data(tmp_path):
+    response = FakeResponse(
+        200,
+        {"Content-Type": "image/jpeg"},
+        [image_bytes("red")[:-1]],
+    )
+
+    paths, warnings = download_images(
+        ["https://images.example.com/truncated.jpg"],
+        tmp_path,
+        http_get=lambda *args, **kwargs: response,
+        resolver=public_resolver,
+    )
+
+    assert paths == []
+    assert list(tmp_path.iterdir()) == []
+    assert warnings == ["Some listing images could not be used."]
+
+
+def test_download_images_removes_partial_file_after_interrupted_write(
+    monkeypatch, tmp_path
+):
+    def interrupted_write(path, data):
+        with path.open("wb") as file:
+            file.write(data[:16])
+        raise OSError("write interrupted")
+
+    monkeypatch.setattr(Path, "write_bytes", interrupted_write)
+    response = FakeResponse(
+        200,
+        {"Content-Type": "image/jpeg"},
+        [image_bytes("red")],
+    )
+
+    paths, warnings = download_images(
+        ["https://images.example.com/truck.jpg"],
+        tmp_path,
+        http_get=lambda *args, **kwargs: response,
+        resolver=public_resolver,
+    )
+
+    assert paths == []
+    assert list(tmp_path.iterdir()) == []
+    assert warnings == ["Some listing images could not be used."]
+
+
 def test_download_images_keeps_at_most_eight_and_attempts_at_most_twenty_four(
     monkeypatch, tmp_path
 ):

@@ -240,7 +240,7 @@ def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddri
                 finally:
                     response.close()
             with Image.open(BytesIO(content)) as image:
-                image.verify()
+                image.load()
                 suffix = "." + (image.format or "jpg").lower().replace("jpeg", "jpg")
             digest = hashlib.sha256(content).digest()
             if digest in hashes:
@@ -248,7 +248,11 @@ def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddri
                 continue
             hashes.add(digest)
             path = output_dir / f"{len(paths)}{suffix}"
-            path.write_bytes(content)
+            try:
+                path.write_bytes(content)
+            except OSError:
+                path.unlink(missing_ok=True)
+                raise
             paths.append(str(path))
         except (ListingExtractionError, OSError, requests.RequestException):
             rejected += 1
