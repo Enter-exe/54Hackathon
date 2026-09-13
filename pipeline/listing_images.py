@@ -1,8 +1,79 @@
+import json
+from html.parser import HTMLParser
 import ipaddress
 import socket
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
+
+
+class _ImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+        self.json_scripts = []
+        self._json_parts = None
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if tag == "meta" and values.get("property", values.get("name", "")).lower() in {
+            "og:image", "og:image:url", "twitter:image"
+        }:
+            self.urls.append(values.get("content"))
+        if tag == "img":
+            self.urls.extend(values.get(name) for name in ("src", "data-src", "data-lazy-src"))
+            for item in values.get("srcset", "").split(","):
+                self.urls.append(item.strip().split(" ", 1)[0])
+        if tag == "script" and values.get("type", "").lower() == "application/ld+json":
+            self._json_parts = []
+
+    def handle_data(self, data):
+        if self._json_parts is not None:
+            self._json_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "script" and self._json_parts is not None:
+            self.json_scripts.append("".join(self._json_parts))
+            self._json_parts = None
+
+
+def _json_image_values(value, key=None):
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _json_image_values(child, child_key.lower())
+    elif isinstance(value, list):
+        for child in value:
+            yield from _json_image_values(child, key)
+    elif isinstance(value, str) and key in {"image", "contenturl", "thumbnailurl"}:
+        yield value
+
+
+def _dedupe(values):
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def extract_image_urls(html: str, page_url: str) -> list[str]:
+    parser = _ImageParser()
+    parser.feed(html)
+    structured = []
+    for script in parser.json_scripts:
+        try:
+            structured.extend(_json_image_values(json.loads(script)))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    absolute = [
+        urljoin(page_url, value)
+        for value in [*structured, *parser.urls]
+        if isinstance(value, str) and value and not value.startswith("data:")
+    ]
+    host = urlsplit(page_url).hostname or ""
+    if host.endswith("purplewave.com"):
+        preferred = [url for url in absolute if "cloudfront.net/i/a/" in url]
+    elif host.endswith("commercialtrucktrader.com"):
+        preferred = [url for url in absolute if "tilabs.io" in url]
+    else:
+        preferred = []
+    return _dedupe([*preferred, *absolute])
 
 
 class ListingExtractionError(ValueError):

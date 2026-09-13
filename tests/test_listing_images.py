@@ -2,7 +2,48 @@ import socket
 
 import pytest
 
-from pipeline.listing_images import ListingExtractionError, validate_public_url
+from pipeline.listing_images import ListingExtractionError, extract_image_urls, validate_public_url
+
+
+def test_extracts_purple_wave_listing_images_before_generic_assets():
+    html = """
+      <meta property="og:image" content="https://d323w7klwy72q3.cloudfront.net/i/a/FK3297.JPG">
+      <img src="/logo.png">
+      <img data-src="https://d323w7klwy72q3.cloudfront.net/i/a/FK3297A.JPG">
+    """
+    assert extract_image_urls(html, "https://www.purplewave.com/auction/item/FK3297")[:2] == [
+        "https://d323w7klwy72q3.cloudfront.net/i/a/FK3297.JPG",
+        "https://d323w7klwy72q3.cloudfront.net/i/a/FK3297A.JPG",
+    ]
+
+
+def test_extracts_ctt_and_generic_structured_images_without_price_fields():
+    html = """
+      <script type="application/ld+json">
+        {"@type":"Product","offers":{"price":"72000"},
+         "image":["https://cdn-media.tilabs.io/a.webp","/b.jpg"]}
+      </script>
+      <img srcset="/small.jpg 320w, /large.jpg 1280w">
+    """
+    urls = extract_image_urls(html, "https://www.commercialtrucktrader.com/listing/123")
+    assert urls == [
+        "https://cdn-media.tilabs.io/a.webp",
+        "https://www.commercialtrucktrader.com/b.jpg",
+        "https://www.commercialtrucktrader.com/small.jpg",
+        "https://www.commercialtrucktrader.com/large.jpg",
+    ]
+    assert all("72000" not in url for url in urls)
+
+
+def test_extract_image_urls_deduplicates_and_ignores_data_urls():
+    html = """
+      <meta property="og:image" content="/truck.jpg">
+      <img src="/truck.jpg">
+      <img src="data:image/png;base64,AAAA">
+    """
+    assert extract_image_urls(html, "https://example.com/listing") == [
+        "https://example.com/truck.jpg"
+    ]
 
 
 def public_resolver(host, port, type=socket.SOCK_STREAM):
