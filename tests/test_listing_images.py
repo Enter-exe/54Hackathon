@@ -105,38 +105,128 @@ def public_resolver(host, port, type=socket.SOCK_STREAM):
     return [(socket.AF_INET, type, 6, "", ("93.184.216.34", port))]
 
 
-class FakePage:
-    url = "https://example.com/final"
+class FakeBrowserResponse:
+    def __init__(self, status=200, headers=None):
+        self.status = status
+        self.headers = headers or {}
 
-    def route(self, pattern, handler):
-        self.route_handler = handler
+
+class FakeRoute:
+    def __init__(self, url, status=200, headers=None, redirected_from=None):
+        self.request = SimpleNamespace(url=url, redirected_from=redirected_from)
+        self.response = FakeBrowserResponse(status, headers)
+        self.aborted = False
+        self.fulfilled = False
+        self.fetch_max_redirects = None
+        self.fetch_timeout = None
+
+    def fetch(self, *, max_redirects, timeout):
+        self.fetch_max_redirects = max_redirects
+        self.fetch_timeout = timeout
+        return self.response
+
+    def abort(self):
+        self.aborted = True
+
+    def fulfill(self, *, response):
+        assert response is self.response
+        self.fulfilled = True
+
+
+class FakeWebSocket:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakePage:
+    def __init__(
+        self, *, routes=None, popup_routes=None, web_sockets=None, content_route=None
+    ):
+        self.url = "https://example.com/final"
+        self.routes = routes or []
+        self.popup_routes = popup_routes or []
+        self.web_sockets = web_sockets or []
+        self.content_route = content_route
+        self.context = None
+        self.closed = False
+        self.goto_error = None
 
     def goto(self, url, wait_until, timeout):
         self.requested_url = url
+        routes = self.routes or [FakeRoute(url)]
+        for route in [*routes, *self.popup_routes]:
+            self.context.route_handler(route)
+            if route.aborted:
+                raise RuntimeError("request aborted")
+        for web_socket in self.web_sockets:
+            self.context.web_socket_handler(web_socket)
+        if self.goto_error:
+            raise self.goto_error
 
     def wait_for_load_state(self, state, timeout):
         pass
 
     def content(self):
+        if self.content_route is not None:
+            self.context.route_handler(self.content_route)
         return '<meta property="og:image" content="/truck.jpg">'
+
+    def close(self):
+        self.closed = True
+
+
+class FakeContext:
+    def __init__(self, page, fail_new_page=False):
+        self.page = page
+        self.fail_new_page = fail_new_page
+        self.route_handler = None
+        self.web_socket_handler = None
+        self.closed = False
+
+    def route(self, pattern, handler):
+        self.route_handler = handler
+
+    def route_web_socket(self, pattern, handler):
+        self.web_socket_handler = handler
+
+    def new_page(self):
+        assert self.route_handler is not None
+        if self.fail_new_page:
+            raise RuntimeError("page creation failed")
+        self.page.context = self
+        return self.page
+
+    def close(self):
+        self.closed = True
 
 
 class FakeBrowser:
-    def __init__(self, page):
-        self.page = page
+    def __init__(self, page, fail_new_page=False, fail_context=False):
+        self.context = FakeContext(page, fail_new_page)
+        self.fail_context = fail_context
+        self.context_options = None
         self.closed = False
 
-    def new_context(self, user_agent, accept_downloads):
-        assert accept_downloads is False
-        return SimpleNamespace(new_page=lambda: self.page)
+    def new_context(self, user_agent, accept_downloads, service_workers):
+        if self.fail_context:
+            raise RuntimeError("context creation failed")
+        self.context_options = {
+            "user_agent": user_agent,
+            "accept_downloads": accept_downloads,
+            "service_workers": service_workers,
+        }
+        return self.context
 
     def close(self):
         self.closed = True
 
 
 class FakePlaywrightManager:
-    def __init__(self, page):
-        self.browser = FakeBrowser(page)
+    def __init__(self, page, fail_new_page=False, fail_context=False):
+        self.browser = FakeBrowser(page, fail_new_page, fail_context)
         self.playwright = SimpleNamespace(
             chromium=SimpleNamespace(launch=lambda headless: self.browser)
         )
@@ -159,14 +249,19 @@ def public_resolver_with_localhost(host, port, type=socket.SOCK_STREAM):
 
 def test_playwright_renderer_returns_final_url_and_html():
     page = FakePage()
-    factory = fake_playwright_factory(page)
+    manager = FakePlaywrightManager(page)
     final_url, html = render_html_with_playwright(
         "https://example.com/start",
         resolver=public_resolver,
-        playwright_factory=factory,
+        playwright_factory=lambda: manager,
     )
     assert final_url == "https://example.com/final"
     assert "truck.jpg" in html
+    assert manager.browser.context_options["accept_downloads"] is False
+    assert manager.browser.context_options["service_workers"] == "block"
+    assert page.closed is True
+    assert manager.browser.context.closed is True
+    assert manager.browser.closed is True
 
 
 def test_playwright_renderer_rejects_unsafe_final_navigation():
@@ -180,47 +275,121 @@ def test_playwright_renderer_rejects_unsafe_final_navigation():
         )
 
 
-class FakeRoute:
-    def __init__(self, url):
-        self.request = SimpleNamespace(url=url)
-        self.aborted = False
-        self.continued = False
-
-    def abort(self):
-        self.aborted = True
-
-    def continue_(self):
-        self.continued = True
-
-
-def test_playwright_renderer_aborts_private_browser_requests():
-    page = FakePage()
-    render_html_with_playwright(
+def test_playwright_renderer_rejects_public_to_private_redirect_before_contact():
+    route = FakeRoute(
         "https://example.com/start",
-        resolver=public_resolver_with_localhost,
-        playwright_factory=fake_playwright_factory(page),
+        status=302,
+        headers={"location": "http://127.0.0.1/private"},
     )
+    page = FakePage(routes=[route])
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver_with_localhost,
+            playwright_factory=fake_playwright_factory(page),
+        )
+
+    assert error.value.code == "unsafe_url"
+    assert route.fetch_max_redirects == 0
+    assert route.fulfilled is False
+
+
+def test_playwright_renderer_rejects_non_http_request_before_fetch():
+    route = FakeRoute("file:///etc/passwd")
+    page = FakePage(routes=[route])
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+            playwright_factory=fake_playwright_factory(page),
+        )
+
+    assert error.value.code == "unsafe_url"
+    assert route.fetch_max_redirects is None
+
+
+def test_playwright_renderer_preserves_late_unsafe_route_failure():
     route = FakeRoute("http://127.0.0.1/private")
+    page = FakePage(content_route=route)
 
-    page.route_handler(route)
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver_with_localhost,
+            playwright_factory=fake_playwright_factory(page),
+        )
 
-    assert route.aborted is True
-    assert route.continued is False
+    assert error.value.code == "unsafe_url"
+    assert route.fetch_max_redirects is None
 
 
-def test_playwright_renderer_continues_public_browser_requests():
-    page = FakePage()
+def test_playwright_renderer_fetches_public_request_without_redirects():
+    route = FakeRoute("https://images.example.com/truck.jpg")
+    page = FakePage(routes=[route])
+
     render_html_with_playwright(
         "https://example.com/start",
         resolver=public_resolver,
         playwright_factory=fake_playwright_factory(page),
     )
-    route = FakeRoute("https://images.example.com/truck.jpg")
 
-    page.route_handler(route)
+    assert route.fetch_max_redirects == 0
+    assert route.fetch_timeout == 10_000
+    assert route.fulfilled is True
 
-    assert route.aborted is False
-    assert route.continued is True
+
+def test_playwright_renderer_routes_popup_first_request_through_context():
+    popup_route = FakeRoute("https://popup.example.com/start")
+    page = FakePage(popup_routes=[popup_route])
+
+    render_html_with_playwright(
+        "https://example.com/start",
+        resolver=public_resolver,
+        playwright_factory=fake_playwright_factory(page),
+    )
+
+    assert popup_route.fulfilled is True
+
+
+def test_playwright_renderer_blocks_web_sockets():
+    web_socket = FakeWebSocket()
+    page = FakePage(web_sockets=[web_socket])
+
+    render_html_with_playwright(
+        "https://example.com/start",
+        resolver=public_resolver,
+        playwright_factory=fake_playwright_factory(page),
+    )
+
+    assert web_socket.closed is True
+
+
+def test_playwright_renderer_bounds_redirect_chains():
+    redirected_from = None
+    for index in range(3):
+        redirected_from = SimpleNamespace(
+            url=f"https://example.com/redirect-{index}",
+            redirected_from=redirected_from,
+        )
+    route = FakeRoute(
+        "https://example.com/final-redirect",
+        status=302,
+        headers={"location": "/one-too-many"},
+        redirected_from=redirected_from,
+    )
+    page = FakePage(routes=[route])
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+            playwright_factory=fake_playwright_factory(page),
+        )
+
+    assert error.value.code == "redirect"
+    assert route.fulfilled is False
 
 
 def test_playwright_renderer_reports_missing_optional_dependency(monkeypatch):
@@ -242,10 +411,42 @@ def test_playwright_renderer_reports_missing_optional_dependency(monkeypatch):
     assert error.value.code == "browser_unavailable"
 
 
-def test_playwright_renderer_closes_browser_after_failure():
+def test_playwright_renderer_closes_all_resources_after_navigation_failure():
     page = FakePage()
-    page.content = lambda: (_ for _ in ()).throw(RuntimeError("content failed"))
+    page.goto_error = RuntimeError("navigation failed")
     manager = FakePlaywrightManager(page)
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+            playwright_factory=lambda: manager,
+        )
+
+    assert error.value.code == "browser_failed"
+    assert page.closed is True
+    assert manager.browser.context.closed is True
+    assert manager.browser.closed is True
+
+
+def test_playwright_renderer_closes_context_and_browser_after_page_creation_failure():
+    page = FakePage()
+    manager = FakePlaywrightManager(page, fail_new_page=True)
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+            playwright_factory=lambda: manager,
+        )
+
+    assert error.value.code == "browser_failed"
+    assert manager.browser.context.closed is True
+    assert manager.browser.closed is True
+
+
+def test_playwright_renderer_closes_browser_after_context_creation_failure():
+    manager = FakePlaywrightManager(FakePage(), fail_context=True)
 
     with pytest.raises(ListingExtractionError) as error:
         render_html_with_playwright(

@@ -216,43 +216,87 @@ def render_html_with_playwright(
             ) from exc
         playwright_factory = sync_playwright
 
+    browser = None
+    context = None
+    page = None
     try:
         with playwright_factory() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            try:
-                context = browser.new_context(
-                    user_agent=USER_AGENT,
-                    accept_downloads=False,
-                )
-                page = context.new_page()
+            context = browser.new_context(
+                user_agent=USER_AGENT,
+                accept_downloads=False,
+                service_workers="block",
+            )
+            route_failure = None
 
-                def guard_route(route):
+            def guard_route(route):
+                nonlocal route_failure
+                try:
+                    request_url = validate_public_url(route.request.url, resolver)
+                    response = route.fetch(
+                        max_redirects=0,
+                        timeout=BROWSER_TIMEOUT_MS,
+                    )
+                    if response.status in {301, 302, 303, 307, 308}:
+                        redirects = 0
+                        previous = route.request.redirected_from
+                        while previous is not None:
+                            redirects += 1
+                            previous = previous.redirected_from
+                        location = {
+                            key.lower(): value for key, value in response.headers.items()
+                        }.get("location")
+                        if redirects >= MAX_REDIRECTS or not location:
+                            raise ListingExtractionError(
+                                "redirect", "The listing redirected too many times."
+                            )
+                        validate_public_url(urljoin(request_url, location), resolver)
+                    route.fulfill(response=response)
+                except Exception as exc:
+                    if route_failure is None:
+                        route_failure = exc
                     try:
-                        validate_public_url(route.request.url, resolver)
-                    except ListingExtractionError:
                         route.abort()
-                    else:
-                        route.continue_()
+                    except Exception:
+                        pass
 
-                page.route("**/*", guard_route)
+            context.route("**/*", guard_route)
+            route_web_socket = getattr(context, "route_web_socket", None)
+            if route_web_socket is None:
+                raise ListingExtractionError(
+                    "browser_unavailable",
+                    "This page needs a browser to extract photos; upload them manually.",
+                )
+            route_web_socket("**/*", lambda web_socket: web_socket.close())
+            page = context.new_page()
+            try:
                 page.goto(
                     safe_url,
                     wait_until="domcontentloaded",
                     timeout=BROWSER_TIMEOUT_MS,
                 )
-                try:
-                    page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
-                except Exception:
-                    pass
-                final_url = validate_public_url(page.url, resolver)
-                html = page.content()
-                if len(html.encode("utf-8")) > MAX_HTML_BYTES:
-                    raise ListingExtractionError(
-                        "too_large", "The rendered listing page is too large."
-                    )
-                return final_url, html
-            finally:
-                browser.close()
+            except Exception as exc:
+                if route_failure is not None:
+                    raise route_failure from exc
+                raise
+            if route_failure is not None:
+                raise route_failure
+            try:
+                page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+            except Exception:
+                if route_failure is not None:
+                    raise route_failure
+            if route_failure is not None:
+                raise route_failure
+            final_url = validate_public_url(page.url, resolver)
+            html = page.content()
+            if route_failure is not None:
+                raise route_failure
+            if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+                raise ListingExtractionError(
+                    "too_large", "The rendered listing page is too large."
+                )
+            return final_url, html
     except ListingExtractionError:
         raise
     except Exception as exc:
@@ -260,6 +304,13 @@ def render_html_with_playwright(
             "browser_failed",
             "The listing could not be rendered automatically; upload its photos manually.",
         ) from exc
+    finally:
+        for resource in (page, context, browser):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
 
 
 def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddrinfo):
