@@ -1,8 +1,17 @@
+from io import BytesIO
+from pathlib import Path
 import socket
 
 import pytest
+from PIL import Image
 
-from pipeline.listing_images import ListingExtractionError, extract_image_urls, validate_public_url
+from pipeline.listing_images import (
+    ListingExtractionError,
+    download_images,
+    extract_image_urls,
+    extract_listing_images,
+    validate_public_url,
+)
 
 
 def test_extracts_purple_wave_listing_images_before_generic_assets():
@@ -135,6 +144,124 @@ class FakeResponse:
 
     def close(self):
         pass
+
+
+def image_bytes(color):
+    buffer = BytesIO()
+    Image.new("RGB", (32, 32), color=color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def test_download_images_validates_content_and_deduplicates_bytes(tmp_path):
+    red = image_bytes("red")
+    responses = {
+        "https://images.example.com/a.jpg": FakeResponse(
+            200, {"Content-Type": "image/jpeg"}, [red]
+        ),
+        "https://images.example.com/copy.jpg": FakeResponse(
+            200, {"Content-Type": "image/jpeg"}, [red]
+        ),
+        "https://images.example.com/not-image.jpg": FakeResponse(
+            200, {"Content-Type": "text/plain"}, [b"nope"]
+        ),
+    }
+    paths, warnings = download_images(
+        list(responses),
+        tmp_path,
+        http_get=lambda url, **kwargs: responses[url],
+        resolver=public_resolver,
+    )
+    assert len(paths) == 1
+    assert Path(paths[0]).is_file()
+    assert warnings == ["Some listing images could not be used."]
+
+
+def test_download_images_keeps_at_most_eight_and_attempts_at_most_twenty_four(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr("pipeline.listing_images.MAX_IMAGES", 2)
+    monkeypatch.setattr("pipeline.listing_images.MAX_CANDIDATES", 3)
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return FakeResponse(
+            200,
+            {"Content-Type": "image/jpeg"},
+            [image_bytes((len(requested), 0, 0))],
+        )
+
+    paths, _ = download_images(
+        [f"https://images.example.com/{i}.jpg" for i in range(10)],
+        tmp_path,
+        http_get=get,
+        resolver=public_resolver,
+    )
+    assert len(paths) == 2
+    assert len(requested) <= 3
+
+
+def test_extract_listing_images_returns_only_image_contract(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "pipeline.listing_images.fetch_html",
+        lambda *args, **kwargs: (
+            "https://example.com/truck",
+            '<meta property="og:image" content="https://images.example.com/truck.jpg">',
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.listing_images.download_images",
+        lambda *args, **kwargs: ([str(tmp_path / "truck.jpg")], []),
+    )
+    result = extract_listing_images(
+        "https://example.com/truck", tmp_path, resolver=public_resolver
+    )
+    assert result == {
+        "source_url": "https://example.com/truck",
+        "source_host": "example.com",
+        "image_paths": [str(tmp_path / "truck.jpg")],
+        "warnings": [],
+    }
+    assert set(result) == {"source_url", "source_host", "image_paths", "warnings"}
+
+
+def test_extract_listing_images_uses_browser_only_when_static_extraction_has_no_candidates(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "pipeline.listing_images.fetch_html",
+        lambda *args, **kwargs: ("https://example.com/truck", "<html></html>"),
+    )
+    monkeypatch.setattr(
+        "pipeline.listing_images.download_images",
+        lambda *args, **kwargs: ([str(tmp_path / "truck.jpg")], []),
+    )
+    rendered = []
+    result = extract_listing_images(
+        "https://example.com/truck",
+        tmp_path,
+        browser_renderer=lambda url: rendered.append(url)
+        or (
+            url,
+            '<meta property="og:image" content="https://images.example.com/truck.jpg">',
+        ),
+        resolver=public_resolver,
+    )
+    assert rendered == ["https://example.com/truck"]
+    assert result["image_paths"]
+
+
+def test_extract_listing_images_raises_when_no_valid_images_remain(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "pipeline.listing_images.fetch_html",
+        lambda *args, **kwargs: ("https://example.com/truck", "<html></html>"),
+    )
+    with pytest.raises(ListingExtractionError, match="photos"):
+        extract_listing_images(
+            "https://example.com/truck", tmp_path, resolver=public_resolver
+        )
 
 
 def test_fetch_html_revalidates_redirect_targets():

@@ -1,9 +1,13 @@
+import hashlib
+from io import BytesIO
 import json
 from html.parser import HTMLParser
 import ipaddress
+from pathlib import Path
 import socket
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+from PIL import Image
 import requests
 
 
@@ -136,6 +140,9 @@ def validate_public_url(url, resolver=socket.getaddrinfo):
 
 MAX_REDIRECTS = 3
 MAX_HTML_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_CANDIDATES = 24
+MAX_IMAGES = 8
 TIMEOUT = (5, 10)
 USER_AGENT = "Kamion image-only appraisal/1.0"
 
@@ -189,3 +196,109 @@ def fetch_html(url, *, http_get=None, resolver=socket.getaddrinfo):
         finally:
             response.close()
     raise AssertionError("redirect loop must return or raise")
+
+
+def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddrinfo):
+    get = http_get or requests.get
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths, hashes = [], set()
+    rejected = 0
+    for image_url in urls[:MAX_CANDIDATES]:
+        if len(paths) == MAX_IMAGES:
+            break
+        try:
+            current = validate_public_url(image_url, resolver)
+            for redirect_count in range(MAX_REDIRECTS + 1):
+                response = get(
+                    current,
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=TIMEOUT,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                try:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count == MAX_REDIRECTS or not response.headers.get(
+                            "Location"
+                        ):
+                            raise ListingExtractionError(
+                                "redirect", "An image redirected too many times."
+                            )
+                        current = validate_public_url(
+                            urljoin(current, response.headers["Location"]), resolver
+                        )
+                        continue
+                    if response.status_code != 200 or not response.headers.get(
+                        "Content-Type", ""
+                    ).lower().startswith("image/"):
+                        raise ListingExtractionError(
+                            "invalid_image", "A candidate URL did not return an image."
+                        )
+                    content = _read_bounded(response, MAX_IMAGE_BYTES)
+                    break
+                finally:
+                    response.close()
+            with Image.open(BytesIO(content)) as image:
+                image.verify()
+                suffix = "." + (image.format or "jpg").lower().replace("jpeg", "jpg")
+            digest = hashlib.sha256(content).digest()
+            if digest in hashes:
+                rejected += 1
+                continue
+            hashes.add(digest)
+            path = output_dir / f"{len(paths)}{suffix}"
+            path.write_bytes(content)
+            paths.append(str(path))
+        except (ListingExtractionError, OSError, requests.RequestException):
+            rejected += 1
+    warnings = ["Some listing images could not be used."] if rejected else []
+    return paths, warnings
+
+
+def extract_listing_images(
+    url,
+    output_dir,
+    *,
+    http_get=None,
+    browser_renderer=None,
+    resolver=socket.getaddrinfo,
+):
+    safe_url = validate_public_url(url, resolver)
+    warnings = []
+    used_browser = False
+    try:
+        final_url, html = fetch_html(safe_url, http_get=http_get, resolver=resolver)
+        candidates = extract_image_urls(html, final_url)
+    except ListingExtractionError as exc:
+        if browser_renderer is None:
+            raise
+        warnings.append(f"Static extraction failed: {exc}")
+        final_url, html = browser_renderer(safe_url)
+        used_browser = True
+        final_url = validate_public_url(final_url, resolver)
+        candidates = extract_image_urls(html, final_url)
+
+    if not candidates and browser_renderer is not None and not used_browser:
+        final_url, html = browser_renderer(final_url)
+        final_url = validate_public_url(final_url, resolver)
+        candidates = extract_image_urls(html, final_url)
+    if not candidates:
+        raise ListingExtractionError(
+            "no_images", "No listing photos could be discovered; upload them manually."
+        )
+
+    paths, download_warnings = download_images(
+        candidates, output_dir, http_get=http_get, resolver=resolver
+    )
+    if not paths:
+        raise ListingExtractionError(
+            "no_images",
+            "No valid listing photos could be downloaded; upload them manually.",
+        )
+    return {
+        "source_url": final_url,
+        "source_host": urlsplit(final_url).hostname,
+        "image_paths": paths,
+        "warnings": [*warnings, *download_warnings],
+    }
