@@ -1,6 +1,8 @@
+import builtins
 from io import BytesIO
 from pathlib import Path
 import socket
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -10,6 +12,7 @@ from pipeline.listing_images import (
     download_images,
     extract_image_urls,
     extract_listing_images,
+    render_html_with_playwright,
     validate_public_url,
 )
 
@@ -100,6 +103,159 @@ def test_site_preferences_require_boundaries_and_parsed_image_hosts():
 
 def public_resolver(host, port, type=socket.SOCK_STREAM):
     return [(socket.AF_INET, type, 6, "", ("93.184.216.34", port))]
+
+
+class FakePage:
+    url = "https://example.com/final"
+
+    def route(self, pattern, handler):
+        self.route_handler = handler
+
+    def goto(self, url, wait_until, timeout):
+        self.requested_url = url
+
+    def wait_for_load_state(self, state, timeout):
+        pass
+
+    def content(self):
+        return '<meta property="og:image" content="/truck.jpg">'
+
+
+class FakeBrowser:
+    def __init__(self, page):
+        self.page = page
+        self.closed = False
+
+    def new_context(self, user_agent, accept_downloads):
+        assert accept_downloads is False
+        return SimpleNamespace(new_page=lambda: self.page)
+
+    def close(self):
+        self.closed = True
+
+
+class FakePlaywrightManager:
+    def __init__(self, page):
+        self.browser = FakeBrowser(page)
+        self.playwright = SimpleNamespace(
+            chromium=SimpleNamespace(launch=lambda headless: self.browser)
+        )
+
+    def __enter__(self):
+        return self.playwright
+
+    def __exit__(self, exc_type, exc, traceback):
+        pass
+
+
+def fake_playwright_factory(page):
+    return lambda: FakePlaywrightManager(page)
+
+
+def public_resolver_with_localhost(host, port, type=socket.SOCK_STREAM):
+    address = "127.0.0.1" if host == "127.0.0.1" else "93.184.216.34"
+    return [(socket.AF_INET, type, 6, "", (address, port))]
+
+
+def test_playwright_renderer_returns_final_url_and_html():
+    page = FakePage()
+    factory = fake_playwright_factory(page)
+    final_url, html = render_html_with_playwright(
+        "https://example.com/start",
+        resolver=public_resolver,
+        playwright_factory=factory,
+    )
+    assert final_url == "https://example.com/final"
+    assert "truck.jpg" in html
+
+
+def test_playwright_renderer_rejects_unsafe_final_navigation():
+    page = FakePage()
+    page.url = "http://127.0.0.1/private"
+    with pytest.raises(ListingExtractionError, match="public"):
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver_with_localhost,
+            playwright_factory=fake_playwright_factory(page),
+        )
+
+
+class FakeRoute:
+    def __init__(self, url):
+        self.request = SimpleNamespace(url=url)
+        self.aborted = False
+        self.continued = False
+
+    def abort(self):
+        self.aborted = True
+
+    def continue_(self):
+        self.continued = True
+
+
+def test_playwright_renderer_aborts_private_browser_requests():
+    page = FakePage()
+    render_html_with_playwright(
+        "https://example.com/start",
+        resolver=public_resolver_with_localhost,
+        playwright_factory=fake_playwright_factory(page),
+    )
+    route = FakeRoute("http://127.0.0.1/private")
+
+    page.route_handler(route)
+
+    assert route.aborted is True
+    assert route.continued is False
+
+
+def test_playwright_renderer_continues_public_browser_requests():
+    page = FakePage()
+    render_html_with_playwright(
+        "https://example.com/start",
+        resolver=public_resolver,
+        playwright_factory=fake_playwright_factory(page),
+    )
+    route = FakeRoute("https://images.example.com/truck.jpg")
+
+    page.route_handler(route)
+
+    assert route.aborted is False
+    assert route.continued is True
+
+
+def test_playwright_renderer_reports_missing_optional_dependency(monkeypatch):
+    original_import = builtins.__import__
+
+    def import_without_playwright(name, *args, **kwargs):
+        if name == "playwright.sync_api":
+            raise ImportError("not installed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_playwright)
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+        )
+
+    assert error.value.code == "browser_unavailable"
+
+
+def test_playwright_renderer_closes_browser_after_failure():
+    page = FakePage()
+    page.content = lambda: (_ for _ in ()).throw(RuntimeError("content failed"))
+    manager = FakePlaywrightManager(page)
+
+    with pytest.raises(ListingExtractionError) as error:
+        render_html_with_playwright(
+            "https://example.com/start",
+            resolver=public_resolver,
+            playwright_factory=lambda: manager,
+        )
+
+    assert error.value.code == "browser_failed"
+    assert manager.browser.closed is True
 
 
 @pytest.mark.parametrize(

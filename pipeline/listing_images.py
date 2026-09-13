@@ -145,6 +145,7 @@ MAX_CANDIDATES = 24
 MAX_IMAGES = 8
 TIMEOUT = (5, 10)
 USER_AGENT = "Kamion image-only appraisal/1.0"
+BROWSER_TIMEOUT_MS = 10_000
 
 
 def _read_bounded(response, maximum):
@@ -196,6 +197,69 @@ def fetch_html(url, *, http_get=None, resolver=socket.getaddrinfo):
         finally:
             response.close()
     raise AssertionError("redirect loop must return or raise")
+
+
+def render_html_with_playwright(
+    url,
+    *,
+    resolver=socket.getaddrinfo,
+    playwright_factory=None,
+):
+    safe_url = validate_public_url(url, resolver)
+    if playwright_factory is None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise ListingExtractionError(
+                "browser_unavailable",
+                "This page needs a browser to extract photos; upload them manually.",
+            ) from exc
+        playwright_factory = sync_playwright
+
+    try:
+        with playwright_factory() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent=USER_AGENT,
+                    accept_downloads=False,
+                )
+                page = context.new_page()
+
+                def guard_route(route):
+                    try:
+                        validate_public_url(route.request.url, resolver)
+                    except ListingExtractionError:
+                        route.abort()
+                    else:
+                        route.continue_()
+
+                page.route("**/*", guard_route)
+                page.goto(
+                    safe_url,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_TIMEOUT_MS,
+                )
+                try:
+                    page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+                except Exception:
+                    pass
+                final_url = validate_public_url(page.url, resolver)
+                html = page.content()
+                if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+                    raise ListingExtractionError(
+                        "too_large", "The rendered listing page is too large."
+                    )
+                return final_url, html
+            finally:
+                browser.close()
+    except ListingExtractionError:
+        raise
+    except Exception as exc:
+        raise ListingExtractionError(
+            "browser_failed",
+            "The listing could not be rendered automatically; upload its photos manually.",
+        ) from exc
 
 
 def download_images(urls, output_dir, *, http_get=None, resolver=socket.getaddrinfo):
