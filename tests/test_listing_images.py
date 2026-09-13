@@ -46,6 +46,49 @@ def test_extract_image_urls_deduplicates_and_ignores_data_urls():
     ]
 
 
+def test_extract_image_urls_normalizes_scheme_and_fragment_before_deduplication():
+    html = """
+      <meta property="og:image" content="HTTPS://example.com/truck.jpg#one">
+      <img src="https://example.com/truck.jpg#two">
+      <img src="DATA:image/png;base64,AAAA">
+    """
+    assert extract_image_urls(html, "https://example.com/listing") == [
+        "https://example.com/truck.jpg"
+    ]
+
+
+def test_extracts_json_ld_with_media_type_parameters():
+    html = """
+      <script type="application/ld+json; charset=utf-8">
+        {"image":"/structured.jpg"}
+      </script>
+    """
+    assert extract_image_urls(html, "https://example.com/listing") == [
+        "https://example.com/structured.jpg"
+    ]
+
+
+def test_site_preferences_require_boundaries_and_parsed_image_hosts():
+    html = """
+      <img src="/generic.jpg">
+      <img src="https://d323w7klwy72q3.cloudfront.net/i/a/listing.jpg">
+      <img src="https://example.com/cloudfront.net/i/a/fake.jpg">
+    """
+    assert extract_image_urls(html, "https://notpurplewave.com/listing")[:2] == [
+        "https://notpurplewave.com/generic.jpg",
+        "https://d323w7klwy72q3.cloudfront.net/i/a/listing.jpg",
+    ]
+
+    html = """
+      <img src="/generic.jpg">
+      <img src="https://cdn-media.tilabs.io/listing.jpg">
+    """
+    assert extract_image_urls(html, "https://notcommercialtrucktrader.com/listing") == [
+        "https://notcommercialtrucktrader.com/generic.jpg",
+        "https://cdn-media.tilabs.io/listing.jpg",
+    ]
+
+
 def public_resolver(host, port, type=socket.SOCK_STREAM):
     return [(socket.AF_INET, type, 6, "", ("93.184.216.34", port))]
 

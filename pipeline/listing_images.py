@@ -24,7 +24,8 @@ class _ImageParser(HTMLParser):
             self.urls.extend(values.get(name) for name in ("src", "data-src", "data-lazy-src"))
             for item in values.get("srcset", "").split(","):
                 self.urls.append(item.strip().split(" ", 1)[0])
-        if tag == "script" and values.get("type", "").lower() == "application/ld+json":
+        media_type = values.get("type", "").split(";", 1)[0].strip().lower()
+        if tag == "script" and media_type == "application/ld+json":
             self._json_parts = []
 
     def handle_data(self, data):
@@ -52,6 +53,22 @@ def _dedupe(values):
     return list(dict.fromkeys(value for value in values if value))
 
 
+def _canonical_image_url(value, page_url):
+    if not isinstance(value, str) or not value:
+        return None
+    if urlsplit(value).scheme.lower() == "data":
+        return None
+    resolved = urljoin(page_url, value)
+    parts = urlsplit(resolved)
+    if parts.scheme.lower() == "data":
+        return None
+    return urlunsplit((parts.scheme.lower(), parts.netloc, parts.path, parts.query, ""))
+
+
+def _host_is(host, domain):
+    return host == domain or host.endswith("." + domain)
+
+
 def extract_image_urls(html: str, page_url: str) -> list[str]:
     parser = _ImageParser()
     parser.feed(html)
@@ -62,15 +79,22 @@ def extract_image_urls(html: str, page_url: str) -> list[str]:
         except (json.JSONDecodeError, TypeError):
             continue
     absolute = [
-        urljoin(page_url, value)
+        url
         for value in [*structured, *parser.urls]
-        if isinstance(value, str) and value and not value.startswith("data:")
+        if (url := _canonical_image_url(value, page_url)) is not None
     ]
-    host = urlsplit(page_url).hostname or ""
-    if host.endswith("purplewave.com"):
-        preferred = [url for url in absolute if "cloudfront.net/i/a/" in url]
-    elif host.endswith("commercialtrucktrader.com"):
-        preferred = [url for url in absolute if "tilabs.io" in url]
+    host = (urlsplit(page_url).hostname or "").lower()
+    if _host_is(host, "purplewave.com"):
+        preferred = [
+            url for url in absolute
+            if _host_is((urlsplit(url).hostname or "").lower(), "cloudfront.net")
+            and urlsplit(url).path.startswith("/i/a/")
+        ]
+    elif _host_is(host, "commercialtrucktrader.com"):
+        preferred = [
+            url for url in absolute
+            if _host_is((urlsplit(url).hostname or "").lower(), "tilabs.io")
+        ]
     else:
         preferred = []
     return _dedupe([*preferred, *absolute])
