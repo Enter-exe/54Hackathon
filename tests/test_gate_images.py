@@ -39,24 +39,21 @@ def test_similarity_margin_compares_best_positive_and_negative_prompt():
     assert margins.tolist() == [pytest.approx(0.7), pytest.approx(-0.5)]
 
 
-def test_gate_keeps_detail_photos_when_one_context_view_is_a_truck(monkeypatch, tmp_path):
+def test_gate_filters_each_nontruck_photo_individually(monkeypatch, tmp_path):
     good = save_image(tmp_path / "good.png", checkerboard())
     nontruck = save_image(tmp_path / "nontruck.png", 255 - checkerboard())
-    dark = save_image(tmp_path / "dark.png", np.zeros((32, 32)))
     monkeypatch.setattr(
         "pipeline.gate_images.truck_similarity_margins",
         lambda *args: np.array([0.05, -0.01]),
     )
 
-    result = gate_images([good, nontruck, dark], object(), object(), "cpu")
+    result = gate_images([good, nontruck], object(), object(), "cpu")
 
     assert result["accepted"] is True
-    assert result["usable_paths"] == [good, nontruck]
+    assert result["usable_paths"] == [good]
     assert result["confidence"] == "low"
-    rejected_reasons = {
-        reason for item in result["rejected"] for reason in item["reasons"]
-    }
-    assert rejected_reasons == {"too_dark", "too_blurry"}
+    assert result["rejected"][-1]["path"] == nontruck
+    assert result["rejected"][-1]["reasons"] == ["not_truck"]
 
 
 def test_gate_rejects_when_no_usable_truck_photo_remains(monkeypatch, tmp_path):

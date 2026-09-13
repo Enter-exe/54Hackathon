@@ -117,10 +117,10 @@ def gate_images(
         margins = truck_similarity_margins(candidates, model, preprocess, device)
         if len(margins) != len(candidates):
             raise ValueError("CLIP returned the wrong number of image scores")
-        if np.max(margins) >= truck_margin:
-            usable_paths = candidates
-        else:
-            for path, margin in zip(candidates, margins):
+        for path, margin in zip(candidates, margins):
+            if margin >= truck_margin:
+                usable_paths.append(path)
+            else:
                 rejected.append(
                     {
                         "path": path,

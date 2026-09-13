@@ -1,4 +1,4 @@
-"""Demo UI: upload photos of a used box truck, get a price range, predicted
+"""Demo UI: provide photos of a used commercial truck, get a price range, predicted
 specs and condition assessment, and comparable listings as reasoning.
 
 Run with: streamlit run ui/app.py
@@ -18,6 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import streamlit as st
 
 from pipeline.condition_assessment import ATTRIBUTES
+from pipeline.listing_images import (
+    ListingExtractionError,
+    extract_listing_images,
+    render_html_with_playwright,
+)
 from ui.appraisal import PRICE_MODEL_PATH, load_resources, run_appraisal
 
 REJECTION_MESSAGES = {
@@ -27,9 +32,41 @@ REJECTION_MESSAGES = {
     "not_truck": "This doesn't look like a truck.",
 }
 
+LISTING_ERROR_MESSAGES = {
+    "unsafe_url": "Enter a public HTTP or HTTPS listing URL.",
+    "unavailable": "We couldn't reach that listing. Check the URL and try again.",
+    "blocked": "That listing site blocked automatic photo extraction.",
+    "redirect": "That listing redirected too many times.",
+    "unsupported": "That URL did not return a supported listing page.",
+    "too_large": "That listing is too large to process automatically.",
+    "no_images": "We couldn't find usable truck photos on that listing.",
+    "browser_unavailable": "Automatic browser extraction is unavailable.",
+    "browser_failed": "We couldn't render that listing automatically.",
+}
+GENERIC_LISTING_ERROR_MESSAGE = (
+    "We couldn't extract photos from that listing automatically."
+)
+
 st.set_page_config(page_title="What's This Truck Worth?", page_icon="🚚", layout="centered")
 
 cached_load_resources = st.cache_resource(load_resources)
+
+
+def appraise_listing_url(
+    url,
+    output_dir,
+    resources,
+    *,
+    extractor=extract_listing_images,
+    appraiser=run_appraisal,
+    browser_renderer=render_html_with_playwright,
+):
+    extraction = extractor(url, output_dir, browser_renderer=browser_renderer)
+    return extraction, appraiser(extraction["image_paths"], resources)
+
+
+def listing_error_message(error: ListingExtractionError) -> str:
+    return LISTING_ERROR_MESSAGES.get(error.code, GENERIC_LISTING_ERROR_MESSAGE)
 
 
 def save_uploads(uploaded_files, tmp_dir: Path) -> list[str]:
@@ -150,7 +187,10 @@ def render_comparables(comparables_result: list[dict] | None) -> None:
 
 def main():
     st.title("🚚 What's This Truck Worth?")
-    st.caption("Upload photos of a used box truck for a price range and condition assessment — photos only, no typed details needed.")
+    st.caption(
+        "Provide photos of a used commercial truck for a price range and condition "
+        "assessment — photos only, no typed details needed."
+    )
 
     resources = cached_load_resources()
     if resources is None:
@@ -163,19 +203,66 @@ def main():
         )
         return
 
-    uploaded_files = st.file_uploader(
-        "Upload truck photos", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True
+    source_mode = st.radio(
+        "How would you like to provide the truck photos?",
+        ["Listing link", "Upload photos"],
+        horizontal=True,
     )
-    if not uploaded_files:
-        st.caption("Bad lighting, awkward angles, a missing view — that's fine, upload what you have.")
-        return
 
-    with st.spinner("Analyzing photos..."):
-        tmp_dir = Path(tempfile.mkdtemp())
-        paths = save_uploads(uploaded_files, tmp_dir)
-        result = run_appraisal(paths, resources)
-
-    st.image(list(uploaded_files), width=150)
+    if source_mode == "Listing link":
+        with st.form("listing-link-form"):
+            listing_url = st.text_input(
+                "Truck listing URL",
+                placeholder="https://www.purplewave.com/auction/260917/item/FK3297",
+            )
+            submitted = st.form_submit_button(
+                "Extract photos and appraise", type="primary"
+            )
+        if not submitted:
+            st.caption(
+                "The estimate uses listing photos only—not the asking price or current bid."
+            )
+            return
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with st.spinner("Extracting and analyzing listing photos…"):
+                    extraction, result = appraise_listing_url(
+                        listing_url, Path(temporary), resources
+                    )
+                st.success(
+                    f"Extracted {len(extraction['image_paths'])} photos from "
+                    f"{extraction['source_host']}."
+                )
+                for warning in extraction["warnings"]:
+                    st.warning(warning)
+                st.image(
+                    extraction["image_paths"],
+                    caption=[
+                        f"Listing photo {index}"
+                        for index in range(1, len(extraction["image_paths"]) + 1)
+                    ],
+                    width=150,
+                )
+        except ListingExtractionError as exc:
+            st.error(listing_error_message(exc))
+            st.info("Switch to Upload photos to continue manually.")
+            return
+    else:
+        uploaded_files = st.file_uploader(
+            "Upload truck photos",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+        )
+        if not uploaded_files:
+            st.caption(
+                "Bad lighting, awkward angles, a missing view—that's fine, upload what you have."
+            )
+            return
+        with tempfile.TemporaryDirectory() as temporary:
+            with st.spinner("Analyzing photos…"):
+                paths = save_uploads(uploaded_files, Path(temporary))
+                result = run_appraisal(paths, resources)
+            st.image(list(uploaded_files), width=150)
 
     if not result["gate"]["accepted"]:
         render_rejection(result["gate"])
