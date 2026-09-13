@@ -175,5 +175,5 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
 
     with open(processed_dir / "condition_calibration.json") as f:
         calibration = json.load(f)
-    assert calibration["percentile"] == pytest.approx(80.0)
+    assert calibration["percentile"] == pytest.approx(98.0)
     assert set(calibration["thresholds"].keys()) == {a["name"] for a in ATTRIBUTES}

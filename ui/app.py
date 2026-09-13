@@ -65,19 +65,36 @@ def render_price(price_result: dict) -> None:
             st.warning(w.replace("_", " ").capitalize())
 
 
+VERIFIED_ATTRIBUTES = {"rust"}  # the only attribute with confirmed recall on real defects in a 113-listing hand-labeled test (artifacts/condition_labeling_combined_report.txt); the other three missed every real defect found for them in that test
+
+
 def render_condition(condition_result: dict) -> None:
     st.subheader("Condition assessment")
     cols = st.columns(len(ATTRIBUTES))
     for col, attr in zip(cols, ATTRIBUTES):
-        r = condition_result[attr["name"]]
-        label = attr["name"].replace("_", " ").title()
+        name = attr["name"]
+        r = condition_result[name]
+        label = name.replace("_", " ").title()
+        verified = name in VERIFIED_ATTRIBUTES
         with col:
-            if r["flag"]:
-                st.error(f"⚠️ {label}")
+            if verified:
+                if r["flag"]:
+                    st.error(f"⚠️ {label}")
+                else:
+                    st.success(f"✓ {label}")
             else:
-                st.success(f"✓ {label}")
+                if r["flag"]:
+                    st.warning(f"⚠️ {label} (experimental)")
+                else:
+                    st.caption(f"— {label} (experimental)")
             st.caption(f"score {r['probability']:.2f}")
-    st.caption("Flags mean this truck looks worse than about 80% of comparable listings on that attribute — not a guarantee of damage.")
+    st.caption("Flags mean this truck looks worse than about 98% of comparable listings on that attribute — a high bar, chosen after hand-checking flags against real photos found the old, looser bar was flagging clean trucks.")
+    st.caption(
+        "Rust is the only attribute checked against real damage so far — it caught both genuine rust cases found "
+        "in a 113-listing hand-labeled test. Body damage, tire wear, and interior wear are marked experimental "
+        "because that same test found a real defect for each (graffiti, worn tires, worn seats/dash) and the model "
+        "missed every one of them — treat those three flags (or the lack of one) as a much weaker signal for now."
+    )
 
 
 def render_predicted_specs(predicted_class_result: list[dict] | None, predicted_make_result: list[dict] | None) -> None:
