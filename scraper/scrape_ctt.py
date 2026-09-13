@@ -117,11 +117,17 @@ def scrape_listings(headless: bool, delay_range: tuple, max_makes: int | None) -
 
 
 def _download_one(ad_id, photo_id, idx, out_dir: Path) -> bool:
-    dest = out_dir / str(ad_id) / f"{idx}_{photo_id}.webp"
+    # CTT's photo_ids are bare hex ids used with CDN_TEMPLATE; other sources
+    # (e.g. TruckPaper) store the already-resolved full URL directly instead.
+    # Always save as .webp regardless of actual format -- the rest of the
+    # pipeline globs specifically for *.webp, and PIL detects format from
+    # file content, not extension, so this is safe.
+    is_full_url = str(photo_id).startswith("http")
+    dest = out_dir / str(ad_id) / f"{idx}_{'url' if is_full_url else photo_id}.webp"
     if dest.exists() and dest.stat().st_size > 2048:
         return True
     dest.parent.mkdir(parents=True, exist_ok=True)
-    url = CDN_TEMPLATE.format(photo_id=photo_id)
+    url = photo_id if is_full_url else CDN_TEMPLATE.format(photo_id=photo_id)
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
         if resp.status_code == 200 and len(resp.content) > 2048:

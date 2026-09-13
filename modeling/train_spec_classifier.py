@@ -56,8 +56,19 @@ def load_data(embeddings_path, listings_path, splits_path, label_column="make_na
     listings = pd.read_parquet(listings_path)
     listing_ids = listings["ad_id"].astype(str)
     labels_by_id = pd.Series(listings[label_column].to_numpy(), index=listing_ids)
+    raw_labels = labels_by_id.reindex(ad_ids)
+
+    # some sources don't have every label (e.g. TruckPaper listings have no
+    # GVWR class_name) -- drop those rows for this label rather than
+    # training on a spurious "NONE" class.
+    has_label = raw_labels.notna().to_numpy()
+    if not has_label.all():
+        ad_ids = ad_ids[has_label]
+        embeddings = embeddings[has_label]
+        raw_labels = raw_labels[has_label]
+
     # scraped make_name has inconsistent casing (e.g. "Isuzu" vs "ISUZU") -- normalize
-    labels = np.array([str(v).upper() for v in labels_by_id.loc[ad_ids].to_numpy()])
+    labels = np.array([str(v).upper() for v in raw_labels.to_numpy()])
 
     splits = json.loads(Path(splits_path).read_text())
     split_of = {str(i): name for name, ids in splits.items() for i in ids}
