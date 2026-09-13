@@ -15,6 +15,7 @@ import pytest
 import torch
 from PIL import Image
 
+from pipeline.data_io import write_listings_csv
 from pipeline.extract_embeddings import embed_images, load_model, pooled_listing_embedding, run
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -91,7 +92,7 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
     listings = pd.DataFrame(
         [
             {
-                "ad_id": 1,
+                "ad_id": "1",
                 "price": 25000,
                 "year": 2020,
                 "make_name": "ISUZU",
@@ -99,7 +100,7 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
                 "image_paths": [good_img],
             },
             {
-                "ad_id": 2,
+                "ad_id": "2",
                 "price": 31000,
                 "year": 2021,
                 "make_name": "FORD",
@@ -107,7 +108,7 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
                 "image_paths": [good_img],
             },
             {
-                "ad_id": 3,  # no valid images -- must be skipped, not crash the run
+                "ad_id": "3",  # no valid images -- must be skipped, not crash the run
                 "price": 40000,
                 "year": 2019,
                 "make_name": "HINO",
@@ -116,22 +117,14 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
             },
         ]
     )
-    listings.to_parquet(processed_dir / "listings_clean.parquet", index=False)
+    write_listings_csv(listings, processed_dir / "listings_clean.csv")
     with open(processed_dir / "splits.json", "w") as f:
-        json.dump({"train": [1], "val": [2], "test": [3]}, f)  # ad_id 3 will get dropped and must be pruned back out
+        json.dump({"train": ["1"], "val": ["2"], "test": ["3"]}, f)  # ad_id 3 will get dropped and must be pruned back out
 
     run(data_dir)
 
-    emb_df = pd.read_parquet(processed_dir / "embeddings.parquet")
-    assert set(emb_df["ad_id"]) == {1, 2}  # ad_id 3 skipped: no usable images
-    assert all(len(e) == 512 for e in emb_df["embedding"])
-    embs = np.stack(emb_df["embedding"].to_numpy())
-    assert not np.isnan(embs).any()
-    norms = np.linalg.norm(embs, axis=1)
-    assert norms == pytest.approx(np.ones(len(norms)), abs=1e-4)
-
     index = np.load(processed_dir / "comparables_index.npz", allow_pickle=True)
-    assert list(index["ad_id"]) == [1]  # only the train-split listing goes into the comparables index
+    assert list(index["ad_id"]) == ["1"]  # only the train-split listing goes into the comparables index
 
     # all-split cache consumed by modeling/train_price.py
     listing_cache = np.load(processed_dir / "listing_embeddings.npz", allow_pickle=False)
@@ -142,4 +135,4 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
     # a consumer cross-checking split coverage against the embeddings (train_price.py) breaks
     with open(processed_dir / "splits.json") as f:
         pruned_splits = json.load(f)
-    assert pruned_splits == {"train": [1], "val": [2], "test": []}
+    assert pruned_splits == {"train": ["1"], "val": ["2"], "test": []}

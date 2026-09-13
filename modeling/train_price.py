@@ -10,6 +10,7 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error, mean_pinball_loss, r2_score
 
+from pipeline.data_io import read_listings_csv
 
 SPLIT_NAMES = ("train", "val", "test")
 QUANTILES = (0.1, 0.5, 0.9)
@@ -43,7 +44,7 @@ def load_training_data(embeddings_path, listings_path, splits_path, condition_ta
     if not np.isfinite(embeddings).all():
         raise ValueError("embeddings must contain only finite values")
 
-    listings = pd.read_parquet(listings_path)
+    listings = read_listings_csv(listings_path)
     missing_columns = {"ad_id", "price"} - set(listings.columns)
     if missing_columns:
         raise ValueError(f"listings missing columns: {sorted(missing_columns)}")
@@ -203,7 +204,7 @@ def main():
         "--embeddings", default="data/processed/listing_embeddings.npz"
     )
     parser.add_argument(
-        "--listings", default="data/processed/listings_clean.parquet"
+        "--listings", default="data/processed/listings_clean.csv"
     )
     parser.add_argument("--splits", default="data/processed/splits.json")
     parser.add_argument("--out-dir", default="artifacts/price_model")

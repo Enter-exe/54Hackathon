@@ -23,6 +23,78 @@ for the source notes and field details.
 
 ## Getting started
 
-Use `truck_sales_100.csv` as the tabular index, matching each row's `item_id`
-to its folder in `images/`. Keep all images from a listing together when
-creating train, validation, and test splits to prevent leakage.
+From the repository root:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python -m pipeline.build_artifacts
+./.venv/bin/python -m scripts.validate_pipeline
+./.venv/bin/streamlit run app.py
+./.venv/bin/pytest -q
+```
+
+The first artifact build downloads the OpenCLIP ViT-B-32 model weights into
+the local model cache. Later builds reuse the cached weights; the Streamlit
+app itself makes no network request during appraisal.
+
+The build contract contains exactly these eight generated artifacts:
+
+- `data/processed/listings_clean.csv` — canonical listing rows with IDs, USD
+  prices, vehicle metadata, JSON-encoded image paths, and source URLs.
+- `data/processed/splits.json` — deterministic `train`, `val`, and `test`
+  listing-ID arrays.
+- `data/processed/listing_embeddings.npz` — aligned `ad_ids` and normalized
+  listing-level `embeddings` arrays.
+- `data/processed/comparables_index.npz` — training-only embeddings plus
+  listing IDs, prices, years, makes, and models for nearest-sale lookup.
+- `data/processed/condition_tags.csv` — listing/split IDs with per-condition
+  probabilities and calibrated Boolean flags.
+- `data/processed/condition_calibration.json` — calibration percentile and
+  per-condition threshold mapping.
+- `artifacts/price_model/price_models.joblib` — quantile identifiers and the
+  three trained LightGBM price models.
+- `artifacts/price_model/price_metrics.json` — validation/test pinball losses,
+  median MAE and R², and interval coverage.
+
+The validator additionally writes `artifacts/validation_report.json`. All of
+these generated artifacts are ignored by Git and should be rebuilt locally
+from the repository inputs.
+
+## Reproduced build and validation
+
+The default build on September 12, 2026 produced 98 usable listings with
+78/10/10 train/validation/test splits. Listing and comparable embeddings were
+finite and unit-normalized; their observed norm range was
+0.99999991–1.00000013. The held-out price metrics were:
+
+| Split | Pinball q10 | Pinball q50 | Pinball q90 | Median MAE | Median R² | Interval coverage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Validation | 601.5640516087482 | 1211.5036984275007 | 541.5432672699678 | 2423.0073968550014 | 0.5530310134687917 | 0.7 |
+| Test | 1026.1801281635949 | 2726.5483061286986 | 1104.0211118473412 | 5453.096612257397 | -0.6581883714522285 | 0.4 |
+
+The six-case validator used test listing `NJ9230` as its unseen US truck. Price
+values below are the exact emitted USD low/median/high estimates; `null` means
+the case was rejected before pricing.
+
+| Case | Accepted | Confidence | USD low / median / high | Flagged conditions | Comparable IDs |
+| --- | --- | --- | --- | --- | --- |
+| Held-out US truck | Yes | high | 5981.004120305139 / 10033.626320079931 / 12730.348976604573 | none | FT6110, EF1319, YA2755 |
+| Dark transform | No | low | null / null / null | none | none |
+| Blurry transform | No | low | null / null / null | none | none |
+| Motorcycle | No | low | null / null / null | none | none |
+| Single truck photo | Yes | low | 0.0 / 13449.925816491394 / 31870.65940474376 | none | YA3412, FN2019, ER1987 |
+| European truck | Yes | low | 1583.891187971476 / 14232.38779357344 / 17247.218844162668 | none | YA1038, ED5143, FC3251 |
+
+Rejected cases reported `no_usable_truck_photos`. The accepted European image
+only demonstrates that the truck-image gate recognizes it; the resulting USD
+estimate is not calibrated for a European or Turkish market.
+
+## Limitations
+
+This is a research prototype trained on 100 completed US auction sales. It
+outputs USD estimates and has no Turkish or European market calibration. The
+small held-out samples and observed negative test R² mean the price estimates
+should be treated as experimental, not as a professional valuation. Image
+condition flags are model signals rather than an inspection or mechanical
+diagnosis.

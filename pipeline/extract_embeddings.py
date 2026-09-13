@@ -8,9 +8,9 @@ the price model trained on its output (see pipeline/clean_split.py docstring
 for why that means we don't need a held-out split just for this).
 
 Output:
-  data/processed/embeddings.parquet   -- ad_id, split, price, embedding (list[float])
-  data/processed/comparables_index.npz -- train-only embeddings + metadata,
-                                           for nearest-neighbor lookup at inference
+  data/processed/listing_embeddings.npz -- all-split listing embeddings
+  data/processed/comparables_index.npz  -- train-only embeddings + metadata,
+                                          for nearest-neighbor lookup at inference
 """
 import argparse
 import json
@@ -22,6 +22,7 @@ import pandas as pd
 import torch
 from PIL import Image
 
+from pipeline.data_io import read_listings_csv
 from pipeline.gating import build_gate, gate_mask
 
 MODEL_NAME = "ViT-B-32-quickgelu"  # matches OpenAI's original activation; plain ViT-B-32 mismatches quick_gelu and silently degrades embeddings
@@ -86,7 +87,7 @@ def run(data_dir: Path) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    df = pd.read_parquet(processed_dir / "listings_clean.parquet")
+    df = read_listings_csv(processed_dir / "listings_clean.csv")
     with open(processed_dir / "splits.json") as f:
         splits = json.load(f)
     split_of = {}
@@ -121,8 +122,6 @@ def run(data_dir: Path) -> None:
             print(f"  embedded {i}/{n} listings")
 
     emb_df = pd.DataFrame(rows)
-    emb_df.to_parquet(processed_dir / "embeddings.parquet", index=False)
-    print(f"Wrote {processed_dir / 'embeddings.parquet'} ({len(emb_df)} listings)")
 
     # Listings dropped here (no real-photo images survived the gate) must also come out of
     # splits.json, or any consumer that cross-checks split coverage against the embeddings

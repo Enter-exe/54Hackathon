@@ -1,0 +1,3 @@
+-r pipeline/requirements.txt
+-r modeling/requirements.txt
+streamlit

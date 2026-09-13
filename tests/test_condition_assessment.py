@@ -23,6 +23,7 @@ from pipeline.condition_assessment import (
     run,
     score_embedding,
 )
+from pipeline.data_io import write_listings_csv
 from pipeline.extract_embeddings import load_model
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -155,18 +156,18 @@ def test_run_end_to_end(model_and_preprocess, sample_image, tmp_path, monkeypatc
 
     listings = pd.DataFrame(
         [
-            {"ad_id": 1, "image_paths": [sample_image("truck1.jpg", (200, 30, 30))]},
-            {"ad_id": 2, "image_paths": [sample_image("truck2.jpg", (30, 30, 200))]},
-            {"ad_id": 3, "image_paths": [str(tmp_path / "missing.jpg")]},  # must be skipped
+            {"ad_id": "1", "image_paths": [sample_image("truck1.jpg", (200, 30, 30))]},
+            {"ad_id": "2", "image_paths": [sample_image("truck2.jpg", (30, 30, 200))]},
+            {"ad_id": "3", "image_paths": [str(tmp_path / "missing.jpg")]},  # must be skipped
         ]
     )
-    listings.to_parquet(processed_dir / "listings_clean.parquet", index=False)
+    write_listings_csv(listings, processed_dir / "listings_clean.csv")
     with open(processed_dir / "splits.json", "w") as f:
-        json.dump({"train": [1, 2], "val": [], "test": []}, f)
+        json.dump({"train": ["1", "2"], "val": [], "test": []}, f)
 
     run(data_dir)
 
-    out_df = pd.read_parquet(processed_dir / "condition_tags.parquet")
+    out_df = pd.read_csv(processed_dir / "condition_tags.csv")
     assert set(out_df["ad_id"]) == {1, 2}  # ad_id 3 skipped: no usable images
     for attr in ATTRIBUTES:
         assert f"{attr['name']}_prob" in out_df.columns
