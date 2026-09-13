@@ -34,6 +34,10 @@ python3 -m venv .venv
 ./.venv/bin/pytest -q
 ```
 
+The first artifact build downloads the OpenCLIP ViT-B-32 model weights into
+the local model cache. Later builds reuse the cached weights; the Streamlit
+app itself makes no network request during appraisal.
+
 The build contract contains exactly these eight generated artifacts:
 
 - `data/processed/listings_clean.csv` — canonical listing rows with IDs, USD

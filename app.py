@@ -1,6 +1,5 @@
 """Single-screen Streamlit demo for the truck appraisal pipeline."""
 
-import html
 import tempfile
 from pathlib import Path
 
@@ -244,14 +243,14 @@ def render_result(result: dict, photo_names: list[str] | None = None) -> None:
                     LABELS.get(reason, reason.replace("_", " ").title())
                     for reason in photo.get("reasons", [])
                 )
-                st.markdown(f"**{html.escape(name)}** — {html.escape(reasons)}")
+                st.text(f"{name} — {reasons}")
         else:
             reason = LABELS.get(
                 result.get("reasons", ["no_usable_truck_photos"])[0],
                 "No usable truck detected",
             )
             for name in photo_names:
-                st.markdown(f"**{html.escape(name)}** — {html.escape(reason)}")
+                st.text(f"{name} — {reason}")
         return
 
     confidence = result["confidence"].title()
@@ -286,9 +285,9 @@ def render_result(result: dict, photo_names: list[str] | None = None) -> None:
                     caption="Comparable truck",
                     width="stretch",
                 )
-                st.markdown(
-                    f"**{comparable['year']} {html.escape(str(comparable['make_name']))} "
-                    f"{html.escape(str(comparable['model_name']))}**"
+                st.text(
+                    f"{comparable['year']} {comparable['make_name']} "
+                    f"{comparable['model_name']}"
                 )
                 st.metric("Sale price", f"${comparable['price']:,.0f}")
                 st.caption(f"{comparable['similarity']:.0%} visual similarity")
@@ -301,7 +300,8 @@ def render_result(result: dict, photo_names: list[str] | None = None) -> None:
 
 st.title("Kamion Truck Appraisal")
 st.caption(
-    "Prototype estimate from uploaded imagery—not a formal valuation or offer."
+    "Research prototype: USD estimates from 100 completed US auction sales—not "
+    "a formal valuation or offer, and not calibrated for European or Turkish markets."
 )
 
 with st.container(border=True):

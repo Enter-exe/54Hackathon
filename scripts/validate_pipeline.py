@@ -48,6 +48,17 @@ def _absolute_paths(repo_root: Path, paths: list[str]) -> list[str]:
     ]
 
 
+def _require_readable_image(path: Path) -> Path:
+    try:
+        with Image.open(path) as image:
+            image.verify()
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ValueError(
+            f"validation fixture {path.name} must be present and readable"
+        ) from error
+    return path
+
+
 def validate_pipeline(
     repo_root: Path, engine: AppraisalEngine | None = None
 ) -> dict:
@@ -63,8 +74,10 @@ def validate_pipeline(
     if not truck_paths:
         raise ValueError(f"test listing {test_id!r} has no images")
 
-    appraisal_engine = engine or AppraisalEngine.from_artifacts(repo_root)
     fixture_dir = repo_root / "tests/fixtures"
+    motorcycle_path = _require_readable_image(fixture_dir / "motorcycle.jpg")
+    european_path = _require_readable_image(fixture_dir / "european_truck.jpg")
+    appraisal_engine = engine or AppraisalEngine.from_artifacts(repo_root)
     with tempfile.TemporaryDirectory(prefix="kamion-validation-") as directory:
         dark_path = Path(directory) / "dark.jpg"
         blurry_path = Path(directory) / "blurry.jpg"
@@ -74,9 +87,9 @@ def validate_pipeline(
             "held_out_truck": truck_paths,
             "dark": [str(dark_path)],
             "blurry": [str(blurry_path)],
-            "motorcycle": [str(fixture_dir / "motorcycle.jpg")],
+            "motorcycle": [str(motorcycle_path)],
             "single_photo": truck_paths[:1],
-            "non_us_truck": [str(fixture_dir / "european_truck.jpg")],
+            "non_us_truck": [str(european_path)],
         }
         report = {
             name: _summary(appraisal_engine.appraise(paths))
@@ -93,7 +106,15 @@ def validate_pipeline(
     assert not report["dark"]["accepted"], "dark must be rejected"
     assert not report["blurry"]["accepted"], "blurry must be rejected"
     assert not report["motorcycle"]["accepted"], "motorcycle must be rejected"
-    assert report["single_photo"]["confidence"] == "low", (
+    single_photo = report["single_photo"]
+    assert single_photo["accepted"], "single_photo must be accepted"
+    prices = tuple(
+        single_photo[name] for name in ("price_low", "price_median", "price_high")
+    )
+    assert all(price is not None for price in prices) and (
+        prices[0] <= prices[1] <= prices[2]
+    ), "single_photo prices must be non-null and ordered"
+    assert single_photo["confidence"] == "low", (
         "single_photo confidence must be low"
     )
     return report

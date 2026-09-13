@@ -71,6 +71,17 @@ def _rejected() -> dict:
     }
 
 
+def _valid_results() -> list[dict]:
+    return [
+        _accepted(),
+        _rejected(),
+        _rejected(),
+        _rejected(),
+        _accepted("low"),
+        _accepted("low"),
+    ]
+
+
 class FakeEngine:
     def __init__(self, results):
         self.results = iter(results)
@@ -154,7 +165,13 @@ def test_validate_pipeline_aggregates_six_cases_and_writes_json(tmp_path):
     assert report["motorcycle"]["accepted"] is False
     assert report["dark"]["accepted"] is False
     assert report["blurry"]["accepted"] is False
+    assert report["single_photo"]["accepted"] is True
     assert report["single_photo"]["confidence"] == "low"
+    assert (
+        report["single_photo"]["price_low"]
+        <= report["single_photo"]["price_median"]
+        <= report["single_photo"]["price_high"]
+    )
     assert json.loads(
         (repo_root / "artifacts/validation_report.json").read_text()
     ) == report
@@ -168,7 +185,22 @@ def test_validate_pipeline_aggregates_six_cases_and_writes_json(tmp_path):
         (1, _accepted(), "dark must be rejected"),
         (2, _accepted(), "blurry must be rejected"),
         (3, _accepted(), "motorcycle must be rejected"),
+        (4, _rejected(), "single_photo must be accepted"),
         (4, _accepted("high"), "single_photo confidence must be low"),
+        (
+            4,
+            {**_accepted("low"), "price_median": None},
+            "single_photo prices must be non-null and ordered",
+        ),
+        (
+            4,
+            {
+                **_accepted("low"),
+                "price_low": 30_000.0,
+                "price_high": 20_000.0,
+            },
+            "single_photo prices must be non-null and ordered",
+        ),
     ],
 )
 def test_validate_pipeline_enforces_required_outcomes_after_writing_report(
@@ -177,14 +209,7 @@ def test_validate_pipeline_enforces_required_outcomes_after_writing_report(
     # Catches a validation regression being reported as a successful run.
     repo_root = tmp_path / "repo"
     _write_validation_inputs(repo_root)
-    results = [
-        _accepted(),
-        _rejected(),
-        _rejected(),
-        _rejected(),
-        _accepted("low"),
-        _accepted("low"),
-    ]
+    results = _valid_results()
     results[case_index] = invalid_result
 
     with pytest.raises(AssertionError, match=message):
@@ -216,3 +241,31 @@ def test_validate_pipeline_keeps_non_us_outcome_observational(tmp_path):
     )
 
     assert report["non_us_truck"]["accepted"] is False
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "fixture_bytes"),
+    [
+        ("motorcycle.jpg", None),
+        ("motorcycle.jpg", b"not an image"),
+        ("european_truck.jpg", None),
+        ("european_truck.jpg", b"not an image"),
+    ],
+)
+def test_validate_pipeline_requires_readable_validation_fixtures(
+    tmp_path, fixture_name, fixture_bytes
+):
+    # Catches a missing or invalid public fixture becoming a model outcome.
+    repo_root = tmp_path / "repo"
+    _write_validation_inputs(repo_root)
+    fixture_path = repo_root / "tests/fixtures" / fixture_name
+    if fixture_bytes is None:
+        fixture_path.unlink()
+    else:
+        fixture_path.write_bytes(fixture_bytes)
+
+    with pytest.raises(ValueError, match=f"{fixture_name}.*readable"):
+        validate_pipeline(
+            repo_root,
+            engine=FakeEngine(_valid_results()),
+        )

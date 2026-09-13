@@ -21,6 +21,9 @@ def test_app_renders_upload_flow_without_loading_models():
     assert app.title[0].value == "Kamion Truck Appraisal"
     assert app.file_uploader[0].label == "Truck photos"
     assert app.button[0].label == "Appraise truck"
+    assert "USD estimates" in app.caption[0].value
+    assert "100 completed US auction sales" in app.caption[0].value
+    assert "European or Turkish markets" in app.caption[0].value
 
 
 def test_save_uploads_uses_numeric_filenames_and_safe_extensions(tmp_path):
@@ -64,8 +67,8 @@ def test_render_result_shows_complete_accepted_appraisal(tmp_path):
                 "similarity": 0.91 - index / 100,
                 "price": 20_000.0 + index,
                 "year": 2022,
-                "make_name": "Freightliner",
-                "model_name": "Cascadia",
+                "make_name": "Freight*[liner]",
+                "model_name": "Cascadia_(sleeper)",
                 "source_url": f"https://example.com/{index}",
                 "thumbnail_path": str(thumbnail),
             }
@@ -83,11 +86,45 @@ def test_render_result_shows_complete_accepted_appraisal(tmp_path):
         ("Market estimate", "$30,000"),
         ("High", "$38,750"),
     ]
-    assert [metric.label for metric in app.metric[3:]] == ["Sale price"] * 3
     assert app.success[0].value == "High confidence"
     assert app.warning[0].value.startswith("Limited photo coverage")
+    condition_values = {
+        "**Rust**",
+        "10% signal",
+        "No issue flagged",
+        "**Body damage**",
+        "80% signal",
+        "**Review**",
+    }
+    assert [
+        item.value for item in app.markdown if item.value in condition_values
+    ] == [
+        "**Rust**",
+        "10% signal",
+        "No issue flagged",
+        "**Body damage**",
+        "80% signal",
+        "**Review**",
+    ]
     assert len(app.image) == 3
-    assert len(app.get("link_button")) == 3
+    assert [item.value for item in app.text] == [
+        "2022 Freight*[liner] Cascadia_(sleeper)",
+    ] * 3
+    assert [(metric.label, metric.value) for metric in app.metric[3:]] == [
+        ("Sale price", "$20,000"),
+        ("Sale price", "$20,001"),
+        ("Sale price", "$20,002"),
+    ]
+    assert [caption.value for caption in app.caption[-3:]] == [
+        "91% visual similarity",
+        "90% visual similarity",
+        "89% visual similarity",
+    ]
+    assert [button.proto.url for button in app.get("link_button")] == [
+        "https://example.com/0",
+        "https://example.com/1",
+        "https://example.com/2",
+    ]
 
 
 def test_render_result_shows_rejection_recovery_by_photo():
@@ -107,13 +144,14 @@ def test_render_result_shows_rejection_recovery_by_photo():
 
     app = AppTest.from_function(
         _render_result,
-        args=(result, ["cab.jpg", "side.png"]),
+        args=(result, ["*[cab](https://invalid.example)*.jpg", "side.png"]),
         default_timeout=10,
     ).run()
 
     assert not app.exception
     assert app.error[0].value.startswith("No usable truck photos")
     assert not app.metric
-    rendered_rows = [item.value for item in app.markdown]
-    assert any("cab.jpg" in row and "Not a truck" in row for row in rendered_rows)
-    assert any("side.png" in row and "Too dark" in row for row in rendered_rows)
+    assert [item.value for item in app.text] == [
+        "side.png — Too dark, Too blurry",
+        "*[cab](https://invalid.example)*.jpg — Not a truck",
+    ]
